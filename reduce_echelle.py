@@ -35,16 +35,20 @@ Pipeline steps
         – low_rej=50 (preserves real flux), high_rej=3 (kills CRs)
         – ThAr spectra are left untouched
         – outputs: <stem>_star<N>_ec-crr2.fits
-  8.  Manual wavelength identification  (ecidentify on reference star only)
-        a. ecidentify  (interactive)  on the ThAr of the first (reference) star
-        b. refspec     assign the solution to that star's CR-cleaned object
-        – The solution is saved to the IRAF database for step 9 to propagate
-  9.  Automatic wavelength propagation  (ecreidentify to remaining stars)
-        a. ecreidentify (automatic)   propagates solution from ref star to others
-        b. refspec     assign the propagated solution to each object
-        c. dispcor     implant and linearise the wavelength solution
-        – outputs: <stem>_star<N>_ec-crr2-wl.fits
-        – workflow: run step 8 (interactive), then step 9 (automatic on all stars)
+  8.  Reference-star wavelength setup  (manual or reuse existing reference)
+      a. choose mode for first (reference) star:
+        - manual: ecidentify (interactive) on that star's ThAr
+        - reuse : ecreidentify from an already identified ThAr reference
+      b. refspec     assign the solution to that star's CR-cleaned object
+      – The solution is saved/used in the IRAF database for step 9
+  9.  Automatic line-ID propagation + review  (ecreidentify to remaining stars)
+      a. ecreidentify (automatic)   propagates line IDs from ref star to others
+      b. review      inspect reidentified ThAr line IDs (interactive when TTY)
+      c. refspec     assign the reviewed IDs to each object spectrum
+      – outputs: no new FITS files in this section (refspec updates assignments)
+      – workflow: run step 8 (interactive), then step 9 (automatic + review)
+
+# NOTE: "ENOISE" and "EGAIN" keyowrds should always be used in iraf values for readnoise and gain
 
 Usage
 -----
@@ -57,8 +61,7 @@ Usage
         --thar     ThAr-r0651--ot-B-full-Dcrr.fits     \
         --object   jsimonScl_h3_sci_15Sep2014_B-b-d-cr.fits \
         --twilight Twilight-r0652--ot-B-full-Dcrr.fits  \
-        [--rdnoise 3.06]  [--gain 0.584]  [--nstars 4]
-        [--sep 5.0]  [--dispaxis 1]
+        [--nstars 4]  [--sep 5.0]  [--dispaxis 1]
 """
 
 import argparse
@@ -67,6 +70,8 @@ import glob
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import textwrap
 
@@ -444,7 +449,7 @@ def write_output_metadata(path, metadata):
 # Step 1 – apall on quartz: find + trace, NO extract
 # ---------------------------------------------------------------------------
 
-def apall_trace_quartz(quartz, rdnoise, gain, n_ap):
+def apall_trace_quartz(quartz, n_ap):
     """
     Interactively find and trace all apertures on the quartz image.
     Nothing is extracted here; we only want the aperture database written.
@@ -1071,7 +1076,7 @@ def expected_step7_outputs(obj_outputs):
 
 
 # ---------------------------------------------------------------------------
-# Step 8 – wavelength scale  (ecidentify → refspec → dispcor)
+# Step 8/9 – line identification propagation (ecidentify/ecreidentify + refspec)
 # ---------------------------------------------------------------------------
 
 def _ecidentify_thar(thar_ec, coordlist="linelists$thar.dat"):
@@ -1119,7 +1124,7 @@ def _ecidentify_thar(thar_ec, coordlist="linelists$thar.dat"):
     print(f"  ecidentify done: {thar_ec}")
 
 
-def _ecreidentify_thar(thar_ec, ref_thar_ec, coordlist="linelists$thar.dat"):
+def _ecreidentify_thar(thar_ec, ref_thar_ec):
     """
     Run ecreidentify (automatic) on a ThAr multispec using a reference solution.
 
@@ -1130,39 +1135,67 @@ def _ecreidentify_thar(thar_ec, ref_thar_ec, coordlist="linelists$thar.dat"):
     ----------
     thar_ec       : path to ThAr spectrum to be identified (uses reference)
     ref_thar_ec   : path to reference ThAr spectrum with existing solution
-    coordlist      : IRAF line-list path (default: built-in ThAr list)
     """
     print(f"  ecreidentify (automatic): {thar_ec}  <--ref--  {ref_thar_ec}")
-    iraf.noao.echelle.ecreidentify.unlearn()
-    iraf.noao.echelle.ecreidentify(
+    iraf.noao.imred.echelle.ecreidentify.unlearn()
+    iraf.noao.imred.echelle.ecreidentify(
         images     = thar_ec,
         reference  = ref_thar_ec,
-        interactive = iraf.no,
-        find       = iraf.no,
-        recenter   = iraf.yes,
-        database   = "database",
-        coordlist  = coordlist,
-        units      = "",
-        match      = 1.0,
-        maxfeatur  = 100,
-        zwidth     = 10.0,
-        ftype      = "emission",
-        fwidth     = 4.0,
+        shift      = "INDEF",
         cradius    = 5.0,
         threshold  = 10.0,
-        minsep     = 2.0,
-        function   = "legendre",
-        xorder     = 4,
-        yorder     = 4,
-        niterate   = 5,
-        lowreject  = 3.0,
-        highrejec  = 3.0,
         refit      = iraf.yes,
-        newaps     = iraf.no,
-        override   = iraf.no,
-        mode       = "ql",
+        database   = "database",
+        logfiles   = "STDOUT",
     )
     print(f"  ecreidentify done: {thar_ec}")
+
+
+def _review_reidentified_lines(thar_ec, coordlist):
+    """Offer an interactive review pass for reidentified ThAr line IDs."""
+    if not sys.stdin.isatty():
+        print(
+            f"  review: non-interactive mode; skipping manual line-ID review for {thar_ec}"
+        )
+        return
+
+    answer = input(
+        f"  Review reidentified lines for {thar_ec}? [Y/n]: "
+    ).strip().lower()
+    if answer in {"n", "no"}:
+        print(f"  review skipped: {thar_ec}")
+        return
+
+    print(
+        "  Opening ecidentify review for reidentified spectrum.\n"
+        "  Inspect line IDs/residuals, then quit back to continue Step 9."
+    )
+    iraf.noao.echelle.ecidentify.unlearn()
+    iraf.noao.echelle.ecidentify(
+        images    = thar_ec,
+        database  = "database",
+        coordlist = coordlist,
+        units     = "",
+        match     = 1.0,
+        maxfeatur = 1000,
+        zwidth    = 10.0,
+        ftype     = "emission",
+        fwidth    = 4.0,
+        cradius   = 5.0,
+        threshold = 10.0,
+        minsep    = 2.0,
+        function  = "legendre",
+        xorder    = 4,
+        yorder    = 4,
+        niterate  = 5,
+        lowreject = 3.0,
+        highrejec = 3.0,
+        autowrit  = iraf.no,
+        graphic   = "stdgraph",
+        cursor    = "",
+        mode      = "ql",
+    )
+    print(f"  review complete: {thar_ec}")
 
 
 def _refspec_one(obj_ec, thar_ec):
@@ -1229,14 +1262,67 @@ def _dispcor_one(obj_ec, output_spec):
     )
 
 
-def manual_wavelength_identification(crr2_outputs, thar_outputs,
-                                     coordlist="linelists$thar.dat"):
-    """
-    Step 8: Manual wavelength identification on reference star only.
+def _choose_step8_mode(step8_mode):
+    """Resolve Step-8 mode, prompting only for interactive TTY runs."""
+    if step8_mode in {"manual", "reuse"}:
+        return step8_mode
 
-    Runs ecidentify (interactive) on one reference star's ThAr spectrum,
-    then refspec to assign that solution to the corresponding object spectrum.
-    Subsequent stars' solutions can be propagated in step 9 via ecreidentify.
+    if not sys.stdin.isatty():
+        print("  step 8 mode: non-interactive run, defaulting to manual ecidentify")
+        return "manual"
+
+    print("\n  Step 8 mode for reference star:")
+    print("    [m] manual ecidentify")
+    print("    [r] reuse existing identified ThAr (run ecreidentify)")
+
+    while True:
+        answer = input("  Choose mode [m/r] (default: m): ").strip().lower()
+        if answer in {"", "m", "manual"}:
+            return "manual"
+        if answer in {"r", "reuse"}:
+            return "reuse"
+        print("  Please type 'm' for manual or 'r' for reuse.")
+
+
+def _resolve_reuse_reference_thar(reference_thar):
+    """Resolve and validate external reference ThAr path for Step-8 reuse mode."""
+    ref_path = reference_thar
+
+    if not ref_path and sys.stdin.isatty():
+        ref_path = input(
+            "  Path to already identified reference ThAr FITS: "
+        ).strip()
+
+    if not ref_path:
+        raise RuntimeError(
+            "Step 8 reuse mode requires --step8-reference-thar <identified_thar.fits>."
+        )
+
+    require_existing(ref_path, "step 8 reuse reference thar")
+
+    found_db, db_candidates = resolve_existing_wavelength_db(ref_path)
+    if not found_db:
+        raise RuntimeError(
+            "Step 8 reuse mode requires an existing IRAF wavelength database entry "
+            f"for reference ThAr '{ref_path}'. Checked: {', '.join(db_candidates)}"
+        )
+
+    print(f"  reuse reference ThAr : {ref_path}")
+    print(f"  reuse wavelength DB  : {found_db}")
+    return ref_path
+
+
+def manual_wavelength_identification(crr2_outputs, thar_outputs,
+                                     coordlist="linelists$thar.dat",
+                                     step8_mode="ask",
+                                     step8_reference_thar=None):
+    """
+    Step 8: Reference-star wavelength setup (manual or reuse mode).
+
+    Manual mode runs ecidentify on one reference-star ThAr spectrum.
+    Reuse mode runs ecreidentify on that reference star, using an already
+    identified external ThAr reference and its existing IRAF DB entry.
+    Both modes then run refspec on the reference-star object spectrum.
 
     The reference star is the first star (minimum) in the star list.
 
@@ -1248,13 +1334,17 @@ def manual_wavelength_identification(crr2_outputs, thar_outputs,
         ThAr spectra from step 6 (same aperture selection as objects).
     coordlist    : str
         IRAF line-list path (default: built-in ThAr list).
+    step8_mode   : {'ask', 'manual', 'reuse'}
+        Step-8 mode selector.
+    step8_reference_thar : str or None
+        Path to identified reference ThAr for reuse mode.
 
     Returns
     -------
     ref_star : int
         The star number used as reference (minimum in sorted list).
     """
-    section_banner("Step 8 – Manual wavelength identification (ecidentify on reference star)")
+    section_banner("Step 8 – Reference-star wavelength setup (manual/reuse)")
     iraf.noao()
     iraf.echelle()
     iraf.onedspec()
@@ -1268,8 +1358,18 @@ def manual_wavelength_identification(crr2_outputs, thar_outputs,
     print(f"    object : {obj_crr2_ref}")
     print(f"    thar   : {thar_ec_ref}")
 
-    # 8a – ecidentify on reference ThAr (interactive)
-    _ecidentify_thar(thar_ec_ref, coordlist=coordlist)
+    mode = _choose_step8_mode(step8_mode)
+
+    if mode == "manual":
+        # 8a – ecidentify on reference ThAr (interactive)
+        _ecidentify_thar(thar_ec_ref, coordlist=coordlist)
+    else:
+        # 8a-alt – reuse external identified reference via ecreidentify.
+        ref_thar_external = _resolve_reuse_reference_thar(step8_reference_thar)
+        print(
+            "  reuse mode: ecreidentify on reference star using existing identified ThAr"
+        )
+        _ecreidentify_thar(thar_ec_ref, ref_thar_external)
 
     # 8b – refspec: attach ThAr solution to the reference object
     _refspec_one(obj_crr2_ref, thar_ec_ref)
@@ -1280,10 +1380,11 @@ def manual_wavelength_identification(crr2_outputs, thar_outputs,
 def auto_wavelength_propagation(crr2_outputs, thar_outputs, ref_star,
                                 coordlist="linelists$thar.dat"):
     """
-    Step 9: Automatic wavelength propagation to remaining stars.
+    Step 9: Automatic line-ID propagation and review to remaining stars.
 
     Uses ecreidentify to propagate the solution from ref_star to all other
-    stars, then refspec + dispcor to complete the wavelength calibration.
+    stars, offers a review pass for reidentified ThAr spectra, then uses
+    refspec to assign those IDs to object spectra.
 
     Parameters
     ----------
@@ -1292,60 +1393,56 @@ def auto_wavelength_propagation(crr2_outputs, thar_outputs, ref_star,
     thar_outputs : {star_number: path, ...}
         ThAr spectra from step 6 (same aperture selection as objects).
     ref_star     : int
-        Reference star number (should have been manually identified in step 8).
-    coordlist    : str
-        IRAF line-list path (default: built-in ThAr list).
+        Reference star number (should have been calibrated in step 8).
 
     Returns
     -------
-    wlcal_outputs : {star_number: path, ...}
-        Wavelength-calibrated final spectra, suffix -wl.fits.
+    id_assigned_outputs : {star_number: path, ...}
+        Object spectra with ThAr line IDs assigned via refspec (in-place).
     """
-    section_banner("Step 9 – Automatic wavelength propagation (ecreidentify + refspec + dispcor)")
+    section_banner("Step 9 – Automatic line-ID propagation (ecreidentify + review + refspec)")
     iraf.noao()
     iraf.echelle()
     iraf.onedspec()
 
     thar_ec_ref = thar_outputs[ref_star]
-    wlcal_outputs = {}
+    id_assigned_outputs = {}
 
     for star in sorted(crr2_outputs.keys()):
         obj_crr2 = crr2_outputs[star]
         thar_ec  = thar_outputs[star]
-        out_wl   = stem(obj_crr2) + "-wl.fits"
 
         print(f"\n  -- Star {star:02d}")
         print(f"     object : {obj_crr2}")
         print(f"     thar   : {thar_ec}")
-        print(f"     output : {out_wl}")
+        print(f"     output : {obj_crr2}  (line IDs assigned in-place)")
 
         # For reference star, use existing solution (already identified in step 8)
         if star == ref_star:
             print(f"     (reference star — solution from step 8)")
         else:
             # 9a – ecreidentify: propagate solution from reference star
-            _ecreidentify_thar(thar_ec, thar_ec_ref, coordlist=coordlist)
+            _ecreidentify_thar(thar_ec, thar_ec_ref)
+            # 9b – review: inspect reidentified lines before assignment
+            _review_reidentified_lines(thar_ec, coordlist=coordlist)
 
-        # 9b – refspec: attach ThAr solution to the CR-cleaned object
+        # 9c – refspec: attach ThAr solution to the CR-cleaned object
         _refspec_one(obj_crr2, thar_ec)
 
-        # 9c – dispcor: implant the solution and linearise
-        _dispcor_one(obj_crr2, out_wl)
+        id_assigned_outputs[star] = obj_crr2
 
-        wlcal_outputs[star] = out_wl
-
-    return wlcal_outputs
+    return id_assigned_outputs
 
 
 def expected_step8_outputs(crr2_outputs):
-    """Return deterministic step-8 reference star output paths (just refspec, no dispcor)."""
+    """Return deterministic step-8 reference-star outputs (refspec in-place)."""
     ref_star = min(crr2_outputs.keys())
-    return {ref_star: stem(crr2_outputs[ref_star]) + "-wl.fits"}
+    return {ref_star: crr2_outputs[ref_star]}
 
 
 def expected_step9_outputs(crr2_outputs):
-    """Return deterministic step-9 output paths (all stars with dispcor)."""
-    return {star: stem(path) + "-wl.fits" for star, path in crr2_outputs.items()}
+    """Return deterministic step-9 outputs (refspec assignment in-place)."""
+    return {star: path for star, path in crr2_outputs.items()}
 
 
 # ---------------------------------------------------------------------------
@@ -1365,8 +1462,13 @@ def parse_args():
               5. Interactive aperture-trace preview on traced quartz reference
               6. Per-star apall extraction  ->  *_star<N>_ec.fits
               7. Second CR removal (lineclean)  ->  *_ec-crr2.fits
-              8. Manual wavelength identification (ecidentify on reference star)
-              9. Automatic wavelength propagation (ecreidentify + refspec + dispcor)  ->  *-wl.fits
+              8. Reference-star setup (ask/manual ecidentify or reuse via ecreidentify)
+              9. Automatic line-ID propagation (ecreidentify + review + refspec)
+
+                        Optional preprocessing prelude:
+                            Use --run-preprocess to execute image_processing.py in --input-dir
+                            before echelle steps. This prelude is skipped automatically for
+                            late-step reruns (start-step > 1).
 
                         Modular execution:
                             Use --start-step/--end-step to run a contiguous step range.
@@ -1381,6 +1483,16 @@ def parse_args():
     p.add_argument("--twilight", help="Twilight sky mosaic FITS (manual override).")
     p.add_argument("--input-dir", default=".",
                    help="Directory to scan for auto-discovery (default: .).")
+    p.add_argument("--run-preprocess", action="store_true",
+                   help="Run image_processing.py on --input-dir before echelle steps.")
+    p.add_argument("--preprocess-infiles", default=None,
+                   help="Output path for generated infiles list (default: <input-dir>/infiles).")
+    p.add_argument("--preprocess-object", default=None,
+                   help="Pass object name through to image_processing.py --object.")
+    p.add_argument("--preprocess-bias", action="store_true",
+                   help="Pass --bias to image_processing.py.")
+    p.add_argument("--preprocess-flat", default=None,
+                   help="Pass --flat <file> to image_processing.py.")
     p.add_argument("--night", default=None,
                    help="Restrict auto-discovery to this NIGHT value.")
     p.add_argument("--shoe", default=None, choices=["B", "R", "b", "r"],
@@ -1389,10 +1501,6 @@ def parse_args():
                    help="Substring filter applied to auto-discovered science OBJECT.")
     p.add_argument("--yes", action="store_true",
                    help="Continue despite metadata mismatch warnings.")
-    p.add_argument("--rdnoise",  type=float, default=3.06,
-                   help="Read noise in e-  (default: 3.06).")
-    p.add_argument("--gain",     type=float, default=0.584,
-                   help="CCD gain in e-/ADU  (default: 0.584).")
     p.add_argument("--nstars",   type=int,   default=4,
                    help="Number of unique stars in the pattern (default: 4).")
     p.add_argument("--sep",      type=float, default=5.0,
@@ -1411,6 +1519,23 @@ def parse_args():
                    help="Path to saved Step-5 affiliation map JSON.")
     p.add_argument("--coordlist", default="linelists$thar.dat",
                    help="IRAF line list for ecidentify steps 8-9 (default: linelists$thar.dat).")
+    p.add_argument(
+        "--step8-mode",
+        default="ask",
+        choices=["ask", "manual", "reuse"],
+        help=(
+            "Step-8 reference-star mode: ask (TTY prompt), manual (ecidentify), "
+            "or reuse (ecreidentify from --step8-reference-thar)."
+        ),
+    )
+    p.add_argument(
+        "--step8-reference-thar",
+        default=None,
+        help=(
+            "Path to already identified reference ThAr FITS for --step8-mode=reuse. "
+            "A matching IRAF DB entry in ./database must exist."
+        ),
+    )
     p.add_argument("--no-cr", action="store_true",
                    help="Skip step-7 CR removal (keep step-6 *_ec.fits as-is).")
     return p.parse_args()
@@ -1478,6 +1603,131 @@ def require_existing(path, requirement):
     """Fail with a clear message if a required file is missing."""
     if not os.path.exists(path):
         raise RuntimeError(f"Missing required file for {requirement}: {path}")
+
+
+def write_infiles_from_directory(input_dir, infiles_path=None):
+    """Create an image_processing-style infiles list from input_dir/*.fits."""
+    fits_paths = sorted(glob.glob(os.path.join(input_dir, "*.fits")))
+    if not fits_paths:
+        raise RuntimeError(f"No FITS files found in input directory: {input_dir}")
+
+    out_path = infiles_path or os.path.join(input_dir, "infiles")
+    with open(out_path, "w") as fh:
+        for path in fits_paths:
+            fh.write(os.path.basename(path) + "\n")
+    print(f"  Preprocess infiles written: {out_path} ({len(fits_paths)} files)")
+    return out_path
+
+
+def run_image_preprocessing(args):
+    """Run image_processing.py in args.input_dir before echelle reduction."""
+    infiles_path = write_infiles_from_directory(args.input_dir, args.preprocess_infiles)
+    script_path = os.path.join(os.path.dirname(__file__), "image_processing.py")
+    cmd = [sys.executable, script_path, "--infiles", os.path.abspath(infiles_path)]
+
+    if args.preprocess_object:
+        cmd.extend(["--object", args.preprocess_object])
+    if args.preprocess_bias:
+        cmd.append("--bias")
+    if args.preprocess_flat:
+        cmd.extend(["--flat", args.preprocess_flat])
+
+    print("  Launching preprocessing:")
+    print("    " + " ".join(cmd))
+    try:
+        subprocess.run(cmd, check=True, cwd=args.input_dir)
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(
+            f"image_processing.py failed with exit code {exc.returncode}"
+        ) from exc
+
+
+def prepare_quartz_reference_alias(quartz_path, meta_by_role,
+                                   fallback_night=None, fallback_shoe=None):
+    """Create/update a stable quartz alias used for aperture-sensitive steps."""
+    night, shoe = infer_night_shoe(
+        meta_by_role,
+        reference_path=quartz_path,
+        fallback_night=fallback_night,
+        fallback_shoe=fallback_shoe,
+    )
+    alias_name = f"quartz_trace_ref_{night}_{shoe}.fits"
+    alias_path = os.path.join(os.path.dirname(quartz_path) or ".", alias_name)
+
+    src_abs = os.path.abspath(quartz_path)
+    dst_abs = os.path.abspath(alias_path)
+    if src_abs == dst_abs:
+        return alias_path
+
+    needs_copy = (not os.path.exists(alias_path))
+    if not needs_copy:
+        needs_copy = os.path.getmtime(quartz_path) > os.path.getmtime(alias_path)
+    if needs_copy:
+        shutil.copy2(quartz_path, alias_path)
+        print(f"  Quartz reference alias updated: {alias_path}")
+    else:
+        print(f"  Quartz reference alias reused: {alias_path}")
+    return alias_path
+
+
+def ensure_quartz_trace_db_alias(source_quartz, alias_quartz):
+    """Ensure alias quartz has aperture DB by linking/copying source DB."""
+    alias_candidates = quartz_trace_db_candidates(alias_quartz)
+    for candidate in alias_candidates:
+        if os.path.exists(candidate):
+            return candidate
+
+    source_db = None
+    for candidate in quartz_trace_db_candidates(source_quartz):
+        if os.path.exists(candidate):
+            source_db = candidate
+            break
+    if source_db is None:
+        return None
+
+    os.makedirs("database", exist_ok=True)
+    target = alias_candidates[0]
+    if os.path.exists(target):
+        return target
+
+    try:
+        os.symlink(os.path.abspath(source_db), target)
+    except OSError:
+        shutil.copy2(source_db, target)
+    return target
+
+
+def wavelength_db_candidates(thar_path):
+    """Return likely IRAF wavelength-database paths for a ThAr spectrum."""
+    db_dir = "./database"
+    base_stem = stem(thar_path)
+    base_name = os.path.basename(thar_path)
+    candidates = [
+        f"{db_dir}/ec{base_stem}",
+        f"{db_dir}/ec.{base_stem}",
+        f"{db_dir}/ec_{base_stem}",
+        f"{db_dir}/ec{base_name}",
+        f"{db_dir}/ec.{base_name}",
+        f"{db_dir}/ec_{base_name}",
+    ]
+
+    unique = []
+    seen = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        unique.append(candidate)
+    return unique
+
+
+def resolve_existing_wavelength_db(thar_path):
+    """Return the first existing wavelength DB path and full candidate list."""
+    candidates = wavelength_db_candidates(thar_path)
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate, candidates
+    return None, candidates
 
 
 def quartz_trace_db_candidates(quartz):
@@ -1854,6 +2104,16 @@ def main():
     except Exception as exc:
         sys.exit(f"ERROR parsing step range: {exc}")
 
+    if args.run_preprocess:
+        if 1 in selected_steps:
+            section_banner("Preprocessing prelude (image_processing.py)")
+            try:
+                run_image_preprocessing(args)
+            except Exception as exc:
+                sys.exit(f"ERROR preprocessing: {exc}")
+        else:
+            print("  [info] --run-preprocess requested, but start-step > 1; skipping preprocessing.")
+
     try:
         resolved = resolve_inputs(args, required_roles=required_roles)
     except Exception as exc:
@@ -1875,6 +2135,19 @@ def main():
     thar = resolved.get("thar")
     obj = resolved.get("object")
     twilight = resolved.get("twilight")
+    quartz_ref = None
+    if quartz and any(s in selected_steps for s in (1, 5, 6)):
+        try:
+            quartz_ref = prepare_quartz_reference_alias(
+                quartz,
+                meta_by_role,
+                fallback_night=args.night,
+                fallback_shoe=args.shoe,
+            )
+            ensure_quartz_trace_db_alias(quartz, quartz_ref)
+        except Exception as exc:
+            sys.exit(f"ERROR preparing quartz reference alias: {exc}")
+
     step2_expected = {}
     if quartz:
         step2_expected["quartz_sl"] = stem(quartz) + "-sl.fits"
@@ -1890,11 +2163,10 @@ def main():
     print("="*72)
     for label, val in [
             ("quartz",   quartz if quartz else "<not required>"),
+            ("quartz_ref", quartz_ref if quartz_ref else "<not required>"),
             ("thar",     thar if thar else "<not required>"),
             ("object",   obj if obj else "<not required>"),
             ("twilight", twilight if twilight else "<not required>"),
-            ("rdnoise",  f"{args.rdnoise} e-"),
-            ("gain",     f"{args.gain} e-/ADU"),
             ("n_stars",  args.nstars),
             ("sep",      f"{args.sep} px"),
             ("dispaxis", args.dispaxis),
@@ -1927,13 +2199,22 @@ def main():
         n_ap = args.nap if args.nap else 120
         apall_trace_quartz(
             quartz,
-            rdnoise = args.rdnoise,
-            gain    = args.gain,
             n_ap    = n_ap,
         )
+        if quartz_ref:
+            ensure_quartz_trace_db_alias(quartz, quartz_ref)
     elif any(s in selected_steps for s in (2, 6)):
         try:
-            require_quartz_trace_db(quartz, "steps 2/6")
+            if 2 in selected_steps:
+                require_quartz_trace_db(quartz, "step 2")
+            if 6 in selected_steps:
+                if not quartz_ref:
+                    raise RuntimeError(
+                        "Step 6 requires a quartz reference alias. Provide --quartz "
+                        "or run steps 1-4 first."
+                    )
+                ensure_quartz_trace_db_alias(quartz, quartz_ref)
+                require_quartz_trace_db(quartz_ref, "step 6")
         except Exception as exc:
             sys.exit(f"ERROR dependency check: {exc}")
 
@@ -2055,12 +2336,17 @@ def main():
 
     # ── 5. Interactive aperture preview on traced quartz reference ───────────
     if 5 in selected_steps:
-        preview_quartz = quartz if quartz else state.get("quartz_sl")
+        preview_quartz = quartz_ref
         if not preview_quartz:
             sys.exit(
-                "ERROR dependency check: step 5 requires a quartz reference image. "
-                "Provide --quartz or ensure quartz_sl can be auto-discovered."
+                "ERROR dependency check: step 5 requires a quartz reference alias image. "
+                "Provide --quartz or run steps 1-4 first."
             )
+        try:
+            ensure_quartz_trace_db_alias(quartz, preview_quartz)
+            require_quartz_trace_db(preview_quartz, "step 5")
+        except Exception as exc:
+            sys.exit(f"ERROR dependency check: {exc}")
         _centers, pattern = run_aperture_preview(
             preview_quartz,
             n_stars = args.nstars,
@@ -2081,14 +2367,18 @@ def main():
     elif 6 in selected_steps:
         map_path = args.affiliation_map or default_affiliation_map_path(
             meta_by_role,
-            reference_path=quartz,
+            reference_path=quartz_ref or quartz,
             fallback_night=args.night,
             fallback_shoe=args.shoe,
         )
         if os.path.exists(map_path):
             try:
                 mapping = load_affiliation_map(map_path)
-                state["pattern"] = validate_affiliation_map(mapping, quartz, meta_by_role)
+                state["pattern"] = validate_affiliation_map(
+                    mapping,
+                    quartz_ref or quartz,
+                    meta_by_role,
+                )
                 print(f"  Loaded affiliation map: {map_path}")
                 print(f"  Using saved pattern with {len(state['pattern'])} apertures")
             except Exception as exc:
@@ -2108,7 +2398,7 @@ def main():
     # ── 6. Per-star extraction ────────────────────────────────────────────────
     if 6 in selected_steps:
         try:
-            require_quartz_trace_db(quartz, "step 6")
+            require_quartz_trace_db(quartz_ref, "step 6")
             require_existing(state["obj_ff"], "step 6 input object flat-corrected")
             require_existing(state["thar_ff"], "step 6 input thar flat-corrected")
         except Exception as exc:
@@ -2122,7 +2412,7 @@ def main():
 
         obj_outputs, thar_outputs = extract_all_stars(
             state["obj_ff"], state["thar_ff"],
-            quartz  = quartz,
+            quartz  = quartz_ref,
             pattern = state["pattern"],
         )
         for star_num in sorted(obj_outputs):
@@ -2148,7 +2438,7 @@ def main():
         try:
             night, shoe = infer_night_shoe(
                 meta_by_role,
-                reference_path=quartz,
+                reference_path=quartz_ref or quartz,
                 fallback_night=args.night,
                 fallback_shoe=args.shoe,
             )
@@ -2222,7 +2512,7 @@ def main():
         except Exception as exc:
             sys.exit(f"ERROR dependency check: {exc}")
 
-    # ── 8. Manual wavelength identification (interactive on reference star) ───
+    # ── 8. Reference-star wavelength setup (manual/reuse) ───────────────────
     if 8 in selected_steps:
         crr2_outputs = state.get("crr2_outputs", {})
         if not crr2_outputs:
@@ -2234,11 +2524,13 @@ def main():
             )
         ref_star = manual_wavelength_identification(
             crr2_outputs, thar_outputs,
-            coordlist = args.coordlist,
+            coordlist=args.coordlist,
+            step8_mode=args.step8_mode,
+            step8_reference_thar=args.step8_reference_thar,
         )
         state["ref_star"] = ref_star
 
-    # ── 9. Automatic wavelength propagation (ecreidentify to remaining stars) ─
+    # ── 9. Automatic line-ID propagation (ecreidentify + review) ─
     if 9 in selected_steps:
         crr2_outputs = state.get("crr2_outputs", {})
         if not crr2_outputs:
@@ -2254,19 +2546,19 @@ def main():
         # If step 8 didn't run but we're running step 9, verify ref star has solution
         if 8 not in selected_steps:
             ref_thar = thar_outputs[ref_star]
-            db_stem_cand = stem(ref_thar)
-            db_file = f"./database/ec.{db_stem_cand}"
-            if not os.path.exists(db_file):
+            found_db, db_candidates = resolve_existing_wavelength_db(ref_thar)
+            if not found_db:
                 sys.exit(
                     f"ERROR: step 9 requires wavelength solution from step 8. "
-                    f"Run step 8 first on reference star {ref_star:02d}."
+                    f"Run step 8 first on reference star {ref_star:02d}. "
+                    f"(Checked: {', '.join(db_candidates)})"
                 )
         
-        wlcal_outputs = auto_wavelength_propagation(
+        id_assigned_outputs = auto_wavelength_propagation(
             crr2_outputs, thar_outputs, ref_star,
-            coordlist = args.coordlist,
+            coordlist=args.coordlist,
         )
-        state["wlcal_outputs"] = wlcal_outputs
+        state["id_assigned_outputs"] = id_assigned_outputs
 
     # ── Summary ───────────────────────────────────────────────────────────────
     section_banner("Pipeline complete")
@@ -2279,7 +2571,7 @@ def main():
         print(f"  Flat-corrected object: {state['obj_ff']}")
     if "twi_ff" in state:
         print(f"  Flat-corrected twi   : {state['twi_ff']}")
-    if obj_outputs or thar_outputs or state.get("crr2_outputs") or state.get("wlcal_outputs"):
+    if obj_outputs or thar_outputs or state.get("crr2_outputs") or state.get("id_assigned_outputs"):
         print("")
         for s in sorted(set(list(obj_outputs) + list(thar_outputs))):
             if s in obj_outputs:
@@ -2288,17 +2580,18 @@ def main():
                 print(f"         thar      : {thar_outputs[s]}")
             if s in state.get("crr2_outputs", {}):
                 print(f"         crr2      : {state['crr2_outputs'][s]}")
-            if s in state.get("wlcal_outputs", {}):
-                print(f"         wlcal     : {state['wlcal_outputs'][s]}")
-        if state.get("wlcal_outputs"):
+            if s in state.get("id_assigned_outputs", {}):
+                print(f"         line IDs  : {state['id_assigned_outputs'][s]}")
+        if state.get("id_assigned_outputs"):
             print(
-                "\n  Wavelength-calibrated spectra ready for continuum normalisation."
+                "\n  Step 9 complete: line IDs propagated/reviewed and assigned with refspec."
             )
         elif obj_outputs:
             print(
                 "\n  Next steps for each star:\n"
                 "    Step 7  lineclean         ->  *_star<N>_ec-crr2.fits\n"
-                "    Step 8  ecidentify on ThAr, refspec + dispcor  ->  *-wl.fits\n"
+                "    Step 8  ecidentify on ThAr, refspec assignment (in-place)\n"
+                "    Step 9  ecreidentify + review + refspec assignment (in-place)\n"
             )
 
 
