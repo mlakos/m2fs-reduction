@@ -792,15 +792,12 @@ def _fallback_pattern(image_path, n_stars, sep):
         approx_n = int(nrows / max(1.0, sep))
         centers  = np.linspace(sep, nrows - sep, approx_n)
 
-    block   = [0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1]
-    n_pairs = (n_stars + 1) // 2
-    pattern = []
-    for i in range(len(centers)):
-        si  = i // 16
-        pos = i % 16
-        pi  = si % n_pairs
-        off = block[pos]
-        pattern.append(2 * pi + off + 1)
+    # Keep non-interactive fallback identical to aperture_preview default mapping.
+    try:
+        from aperture_preview import default_pattern as _default_pattern
+        pattern = _default_pattern(len(centers), n_stars=n_stars)
+    except Exception:
+        pattern = (np.arange(len(centers), dtype=int) // 4) + 1
     return centers, np.array(pattern, dtype=int)
 
 
@@ -1591,7 +1588,9 @@ def validate_affiliation_map(mapping, quartz_path, meta_by_role):
         issues.append(f"night mismatch: map={mapping['night']} run={night}")
     if str(mapping["shoe"]).upper() != str(shoe).upper():
         issues.append(f"shoe mismatch: map={mapping['shoe']} run={shoe}")
-    if os.path.basename(str(mapping["quartz_path"])) != os.path.basename(quartz_path):
+    if not quartz_path:
+        issues.append("missing quartz reference path for map validation")
+    elif os.path.basename(str(mapping["quartz_path"])) != os.path.basename(quartz_path):
         issues.append(
             "quartz mismatch: "
             f"map={mapping['quartz_path']} run={os.path.basename(quartz_path)}"
@@ -1602,10 +1601,14 @@ def validate_affiliation_map(mapping, quartz_path, meta_by_role):
         issues.append("pattern must be a 1D list of aperture assignments")
         raw_pattern = raw_pattern.reshape(-1)
 
-    if not np.all(np.equal(raw_pattern, np.round(raw_pattern))):
-        issues.append("pattern contains non-integer values")
-
-    pattern = raw_pattern.astype(int)
+    pattern = None
+    try:
+        if not np.all(np.equal(raw_pattern, np.round(raw_pattern))):
+            issues.append("pattern contains non-integer values")
+        pattern = raw_pattern.astype(int)
+    except Exception:
+        issues.append("pattern contains non-numeric values")
+        pattern = np.array([], dtype=int)
     if int(mapping["n_apertures"]) != int(len(pattern)):
         issues.append(
             f"n_apertures mismatch: map={mapping['n_apertures']} pattern_len={len(pattern)}"
@@ -2052,20 +2055,26 @@ def main():
 
     # ── 5. Interactive aperture preview on traced quartz reference ───────────
     if 5 in selected_steps:
+        preview_quartz = quartz if quartz else state.get("quartz_sl")
+        if not preview_quartz:
+            sys.exit(
+                "ERROR dependency check: step 5 requires a quartz reference image. "
+                "Provide --quartz or ensure quartz_sl can be auto-discovered."
+            )
         _centers, pattern = run_aperture_preview(
-            quartz,
+            preview_quartz,
             n_stars = args.nstars,
             sep     = args.sep,
         )
         state["pattern"] = pattern
         map_path = args.affiliation_map or default_affiliation_map_path(
             meta_by_role,
-            reference_path=quartz,
+            reference_path=preview_quartz,
             fallback_night=args.night,
             fallback_shoe=args.shoe,
         )
         try:
-            save_affiliation_map(map_path, pattern, quartz, meta_by_role)
+            save_affiliation_map(map_path, pattern, preview_quartz, meta_by_role)
         except Exception as exc:
             sys.exit(f"ERROR saving affiliation map: {exc}")
         print(f"\n  Total apertures in accepted mapping: {len(pattern)}")
@@ -2105,6 +2114,12 @@ def main():
         except Exception as exc:
             sys.exit(f"ERROR dependency check: {exc}")
 
+        try:
+            obj_meta = meta_by_role.get("object") or read_required_metadata(state["obj_ff"])
+            thar_meta = meta_by_role.get("thar") or read_required_metadata(state["thar_ff"])
+        except Exception as exc:
+            sys.exit(f"ERROR dependency check: could not read step-6 metadata: {exc}")
+
         obj_outputs, thar_outputs = extract_all_stars(
             state["obj_ff"], state["thar_ff"],
             quartz  = quartz,
@@ -2112,20 +2127,20 @@ def main():
         )
         for star_num in sorted(obj_outputs):
             write_output_metadata(obj_outputs[star_num], {
-                "OBJECT": meta_by_role["object"]["OBJECT"],
+                "OBJECT": obj_meta["OBJECT"],
                 "EXPTYPE": "Object_extract",
-                "NIGHT": meta_by_role["object"]["NIGHT"],
-                "SHOE": meta_by_role["object"]["SHOE"],
+                "NIGHT": obj_meta["NIGHT"],
+                "SHOE": obj_meta["SHOE"],
                 "STARNUM": int(star_num),
                 "PROCSTEP": "reduce_step6_extract",
             })
 
         for star_num in sorted(thar_outputs):
             write_output_metadata(thar_outputs[star_num], {
-                "OBJECT": meta_by_role["thar"]["OBJECT"],
+                "OBJECT": thar_meta["OBJECT"],
                 "EXPTYPE": "ThAr_extract",
-                "NIGHT": meta_by_role["thar"]["NIGHT"],
-                "SHOE": meta_by_role["thar"]["SHOE"],
+                "NIGHT": thar_meta["NIGHT"],
+                "SHOE": thar_meta["SHOE"],
                 "STARNUM": int(star_num),
                 "PROCSTEP": "reduce_step6_extract",
             })
@@ -2171,7 +2186,13 @@ def main():
                         ec_path = _p
                         if ec_path.endswith("_ec-crr2.fits"):
                             candidate_ec = ec_path.replace("_ec-crr2.fits", "_ec.fits")
-                            require_existing(candidate_ec, f"step 7 input star {_s:02d} object ec")
+                            if not os.path.exists(candidate_ec):
+                                raise RuntimeError(
+                                    f"Step 7 requires extracted *_ec.fits inputs, but star {_s:02d} "
+                                    f"has only CR-cleaned output: {ec_path}. "
+                                    "Re-run step 6 with current extraction-only behavior, "
+                                    "or run step 8/9 directly if CR-cleaned spectra are already final."
+                                )
                             ec_path = candidate_ec
                         require_existing(ec_path, f"step 7 input star {_s:02d} object ec")
                         obj_outputs[_s] = ec_path
