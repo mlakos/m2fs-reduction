@@ -24,7 +24,7 @@ Pipeline steps
   5.  Interactive aperture-trace preview  (aperture_preview.py)
       – runs on the traced QUARTZ reference image
         – shows all traces coloured by star assignment
-        – user corrects assignments if needed, then presses q
+        – user corrects assignments if needed, then presses q or g
   6.  Per-star apall extraction  (object + thar)
         – the pattern from step 5 is used to build one aperture list per star
         – for each star apall is called once for the object and once for the
@@ -102,6 +102,12 @@ def load_packages():
 def stem(path):
     """Basename without .fits extension."""
     return os.path.splitext(os.path.basename(path))[0]
+
+
+def iraf_spec_token(path):
+    """Return canonical IRAF spectroscopy/database image token (./<root>)."""
+    # Filesystem names stay as *.fits; IRAF spectroscopy tasks use ./<root>.
+    return stem(path)
 
 
 def write_list(listpath, items):
@@ -364,7 +370,7 @@ def resolve_inputs(args, required_roles=None):
     }
 
     if all(manual[r] for r in required_roles):
-        resolved.update({r: manual[r] for r in required_roles})
+        resolved.update({role: path for role, path in manual.items() if path})
         return resolved
 
     if required_roles:
@@ -728,13 +734,13 @@ def flatcorrect_images(thar, obj, twilight, master_flat):
 # Step 5 – interactive aperture-trace preview (just before extraction)
 # ---------------------------------------------------------------------------
 
-def run_aperture_preview(preview_image, n_stars, sep):
+def run_aperture_preview(preview_image, n_stars, sep, preview_out=None):
     """
     Open the interactive matplotlib preview on a reference image for assigning
     aperture traces to stars. This does not require the final extraction image;
     the accepted star-assignment pattern is reused in step 6.
 
-    Returns (centers, pattern) once the user presses q.
+    Returns (centers, pattern) once the user presses q or g.
     """
     section_banner("Step 5 – Interactive aperture-trace preview")
 
@@ -754,10 +760,15 @@ def run_aperture_preview(preview_image, n_stars, sep):
         "    d   press d to mark a trace as deleted (will not be extracted)\n"
         "    f   propagate the corrected pattern forward from that aperture\n"
         "    r   reset all assignments to the auto-generated pattern\n"
-        "    q   accept and continue  <-- this moves the pipeline forward\n"
+        "    q/g accept and continue  <-- this moves the pipeline forward\n"
         "    h   print this reminder\n"
     )
-    centers, pattern = run_preview(preview_image, n_stars=n_stars, sep=sep)
+    centers, pattern = run_preview(
+        preview_image,
+        n_stars=n_stars,
+        sep=sep,
+        out=preview_out,
+    )
 
     # Print a summary for the terminal log
     unique_stars = sorted(np.unique(pattern))
@@ -853,13 +864,15 @@ def _apall_extract_star(image, reference_quartz, aperture_string,
 
     print(f"      apall  apertures={aperture_string!r}  ->  {out_spec}")
 
+    iraf_reference = f"./{stem(reference_quartz)}"
+
     iraf.echelle.apall.unlearn()
     iraf.echelle.apall(
         input       = image,
         output      = out_stem,          # IRAF appends .fits
         apertures   = aperture_string,   # only this star's apertures
         format      = "echelle",
-        references  = reference_quartz,  # all traces live in the quartz database
+        references  = iraf_reference,    # IRAF DB lookup is basename-oriented
         profiles    = "",
 
         interactive = iraf.no,   # extraction only; traces already defined
@@ -883,7 +896,7 @@ def _apall_extract_star(image, reference_quartz, aperture_string,
         b_order     = 1,
         b_sample    = "-10:-6,6:10",
         b_naverage  = -3,
-        b_niterate  = 0,
+        b_niterate  = 5,
         b_low_rejec = 3.0,
         b_high_reje = 3.0,
         b_grow      = 0.0,
@@ -930,6 +943,16 @@ def _apall_extract_star(image, reference_quartz, aperture_string,
         nsubaps     = 1,
         mode        = "ql",
     )
+
+    if not os.path.exists(out_spec):
+        db_candidates = quartz_trace_db_candidates(reference_quartz)
+        raise RuntimeError(
+            "apall produced no output for "
+            f"{os.path.basename(image)} (star {star_number:02d}, apertures={aperture_string}). "
+            "IRAF reported no apertures defined. "
+            f"Reference DB candidates checked: {', '.join(db_candidates)}"
+        )
+
     return out_spec
 
 
@@ -950,7 +973,7 @@ def _lineclean_one(input_spec, output_spec):
         """
         iraf_delete(output_spec)
         try:
-            iraf.onedspec.lineclean.unlearn()
+            iraf.images.imfit.lineclean.unlearn()
         except AttributeError:
             print(f"      [warn] lineclean task not found in IRAF; skipping CR removal for {input_spec}")
             # Fall back to copying file without CR removal
@@ -958,18 +981,18 @@ def _lineclean_one(input_spec, output_spec):
             shutil.copy(input_spec, output_spec)
             return
     
-        iraf.onedspec.lineclean(
+        iraf.images.imfit.lineclean(
                 input     = input_spec,
                 output    = output_spec,
-                apertures = "",          # all apertures in the file
-                crval     = "INDEF",
-                cdelt     = "INDEF",
+                sample    = "*",
+                naverage  = 1,
                 function  = "spline3",
                 order     = 6,
-                low_rejec = 50.0,
-                high_reje = 3.0,
+                low_reject = 50.0,
+                high_reject = 3.0,
                 niterate  = 10,
-                interacti = iraf.no,
+                grow      = 1.0,
+                interactive = iraf.no,
                 mode      = "ql",
         )
         print(f"      lineclean: {input_spec}  ->  {output_spec}")
@@ -1055,6 +1078,8 @@ def second_cosmic_removal(obj_outputs):
         Same keys, new paths with suffix -crr2.fits.
     """
     section_banner("Step 7 – Second cosmic-ray removal (lineclean)")
+    iraf.images()
+    iraf.imfit()
     iraf.noao()
     iraf.imred()
     iraf.echelle()
@@ -1088,43 +1113,57 @@ def _ecidentify_thar(thar_ec, coordlist="linelists$thar.dat"):
       - First run: maxfeatures=100, identify ~5 lines per order manually,
         fit with legendre xorder=4, yorder=4, then press 'l' to load more
         lines from the line list.
-      - Second run (same call after 'q'+'f'+'l'): maxfeatures=1000,
+      - Second run (same call after 'q'+'f'+'l'): maxfeatures=100,
         IRAF remembers the previously identified lines; press 'f' to refit,
         load more, inspect, quit and save.
     We set maxfeatures=100 here; the user is expected to do the
     high-maxfeature pass by re-running the task in the IRAF terminal if
-    needed, or by calling this function a second time with maxfeatures=1000.
+    needed, or by calling this function a second time with maxfeatures=100.
     """
-    print(f"  ecidentify (interactive): {thar_ec}")
-    iraf.noao.echelle.ecidentify.unlearn()
-    iraf.noao.echelle.ecidentify(
-        images    = thar_ec,
-        database  = "database",
-        coordlist = coordlist,
-        units     = "",
-        match     = 1.0,
-        maxfeatur = 100,          # user increases to 1000 in the second pass
-        zwidth    = 10.0,
-        ftype     = "emission",
-        fwidth    = 4.0,
-        cradius   = 5.0,
-        threshold = 10.0,
-        minsep    = 2.0,
-        function  = "legendre",
-        xorder    = 4,
-        yorder    = 4,
-        niterate  = 5,
-        lowreject = 3.0,
-        highrejec = 3.0,
-        autowrit  = iraf.no,
-        graphic   = "stdgraph",
-        cursor    = "",
-        mode      = "ql",
-    )
+    iraf_image = iraf_spec_token(thar_ec)
+    print(f"  ecidentify (interactive): file={thar_ec}, iraf={iraf_image}")
+    # Get the task object
+    ecid = iraf.noao.imred.echelle.ecidentify
+
+    # Reset learned/cached task parameters
+    iraf.unlearn(ecid)
+
+    # Set parameters first
+    ecid.images     = iraf_image
+    ecid.database   = "database"
+    ecid.coordlist  = coordlist
+    ecid.units      = ""
+    ecid.match      = 1.0
+    ecid.maxfeatures = 100
+    ecid.zwidth     = 10.0
+    ecid.ftype      = "emission"
+    ecid.fwidth     = 4.0
+    ecid.cradius    = 5.0
+    ecid.threshold  = 10.0
+    ecid.minsep     = 2.0
+    ecid.function   = "legendre"
+    ecid.xorder     = 4
+    ecid.yorder     = 4
+    ecid.niterate   = 5
+    ecid.lowreject  = 3.0
+    ecid.highreject = 3.0
+    ecid.autowrite  = iraf.no
+    ecid.graphics   = "stdgraph"
+    ecid.cursor     = ""
+    ecid.mode       = "ql"
+
+    # Inspect before execution
+    ecid.lParam()
+
+    # Then execute
+    ecid()
     print(f"  ecidentify done: {thar_ec}")
 
 
-def _ecreidentify_thar(thar_ec, ref_thar_ec):
+def _ecreidentify_thar(thar_ec, ref_thar_ec, drift_log_path=None, drift_stage="step9",
+                       predicted_shift=None, search_radius=None,
+                       allow_indef_fallback=True,
+                       reference_override=None):
     """
     Run ecreidentify (automatic) on a ThAr multispec using a reference solution.
 
@@ -1135,49 +1174,281 @@ def _ecreidentify_thar(thar_ec, ref_thar_ec):
     ----------
     thar_ec       : path to ThAr spectrum to be identified (uses reference)
     ref_thar_ec   : path to reference ThAr spectrum with existing solution
+    predicted_shift : float or None
+        Model-driven shift hint for ecreidentify. If None, uses INDEF.
+    search_radius : float or None
+        Correlation search radius in pixels. If None, defaults to 8.0.
+    allow_indef_fallback : bool
+        If True, retry once with shift=INDEF when hinted call fails.
     """
-    print(f"  ecreidentify (automatic): {thar_ec}  <--ref--  {ref_thar_ec}")
-    iraf.noao.imred.echelle.ecreidentify.unlearn()
-    iraf.noao.imred.echelle.ecreidentify(
-        images     = thar_ec,
-        reference  = ref_thar_ec,
-        shift      = "INDEF",
-        cradius    = 5.0,
-        threshold  = 10.0,
-        refit      = iraf.yes,
-        database   = "database",
-        logfiles   = "STDOUT",
+    reference_input = reference_override if reference_override else ref_thar_ec
+    iraf_target_token = iraf_spec_token(thar_ec)
+    iraf_reference_token = iraf_spec_token(reference_input)
+
+    found_db = None
+    for probe in (reference_input, os.path.basename(reference_input), stem(reference_input), iraf_reference_token):
+        found_db, _db_candidates = resolve_existing_wavelength_db(probe)
+        if found_db:
+            break
+
+    if found_db:
+        # Keep DB lookup permissive, but normalize actual IRAF task identity.
+        for alias_probe in (reference_input, os.path.basename(reference_input), stem(reference_input), iraf_reference_token):
+            ensure_wavelength_db_aliases(alias_probe, found_db)
+
+    shift_value = "INDEF" if predicted_shift is None else float(predicted_shift)
+    cradius_value = 8.0 if search_radius is None else float(search_radius)
+    fallback_used = False
+
+    print(
+        "  ecreidentify (automatic): "
+        f"target_file={thar_ec}, target_iraf={iraf_target_token}, "
+        f"ref_file={reference_input}, ref_iraf={iraf_reference_token}  "
+        f"[shift={shift_value}, cradius={cradius_value}]"
     )
+    task_log = f".ecreidentify_{stem(thar_ec)}_{os.getpid()}.log"
+    iraf.noao.imred.echelle.ecreidentify.unlearn()
+
+    def _run_once(shift_arg):
+        iraf.noao.imred.echelle.ecreidentify(
+            images     = iraf_target_token,
+            reference  = iraf_reference_token,
+            shift      = shift_arg,
+            cradius    = cradius_value,
+            threshold  = 10.0,
+            refit      = iraf.yes,
+            database   = "database",
+            logfiles   = f"STDOUT,{task_log}",
+        )
+
+    try:
+        _run_once(shift_value)
+    except Exception as exc:
+        should_fallback = (
+            allow_indef_fallback and
+            shift_value != "INDEF"
+        )
+        if not should_fallback:
+            raise
+        print(
+            "  [warn] hinted ecreidentify failed; retrying with shift=INDEF "
+            f"({exc})"
+        )
+        fallback_used = True
+        _run_once("INDEF")
+        shift_value = "INDEF"
+
+    metrics = _parse_ecreidentify_metrics(task_log, thar_ec)
+    if metrics is None:
+        metrics = {}
+    metrics.update(
+        {
+            "requested_shift": predicted_shift,
+            "used_shift": shift_value,
+            "search_radius": cradius_value,
+            "fallback_indef": bool(fallback_used),
+        }
+    )
+    append_reidentify_drift(
+        drift_log_path,
+        stage=drift_stage,
+        target_thar=os.path.basename(thar_ec),
+        reference_thar=os.path.basename(reference_input),
+        metrics=metrics,
+    )
+    parsed_metrics = (
+        metrics.get("found_num") is not None and
+        metrics.get("found_den") is not None and
+        metrics.get("fit_num") is not None and
+        metrics.get("fit_den") is not None
+    )
+    if parsed_metrics:
+        found_num = metrics.get("found_num")
+        found_den = metrics.get("found_den")
+        fit_num = metrics.get("fit_num")
+        fit_den = metrics.get("fit_den")
+        pix_shift = metrics.get("pix_shift")
+        rms = metrics.get("rms")
+        print(
+            "  drift: "
+            f"found={found_num}/{found_den}, fit={fit_num}/{fit_den}, "
+            f"pix_shift={pix_shift}, rms={rms}"
+        )
+    else:
+        print(f"  [warn] could not parse ecreidentify drift metrics for {thar_ec}")
+
+    if os.path.exists(task_log):
+        os.remove(task_log)
     print(f"  ecreidentify done: {thar_ec}")
+    return metrics
+
+
+def _as_float_or_none(value):
+    """Return float(value) when possible, otherwise None."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text.upper() == "INDEF":
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _parse_ecreidentify_metrics(log_path, target_image):
+    """Parse IRAF ecreidentify summary row from a logfile."""
+    if not os.path.exists(log_path):
+        return None
+
+    target_stem = stem(target_image)
+    pattern = re.compile(
+        r"^\s*(\S+)\s+(\d+)/(\d+)\s+(\d+)/(\d+)\s+([-+\d\.Ee]+)\s+([-+\d\.Ee]+)\s+([-+\d\.Ee]+)\s+(\S+)\s*$"
+    )
+
+    with open(log_path, "r") as fh:
+        for line in fh:
+            m = pattern.match(line)
+            if not m:
+                continue
+            image_token = m.group(1)
+            if stem(image_token) != target_stem:
+                continue
+
+            found_num = int(m.group(2))
+            found_den = int(m.group(3))
+            fit_num = int(m.group(4))
+            fit_den = int(m.group(5))
+            pix_shift = _as_float_or_none(m.group(6))
+            user_shift = _as_float_or_none(m.group(7))
+            z_shift = _as_float_or_none(m.group(8))
+            rms = _as_float_or_none(m.group(9))
+            found_frac = (found_num / found_den) if found_den else None
+            fit_frac = (fit_num / fit_den) if fit_den else None
+            return {
+                "image": image_token,
+                "found_num": found_num,
+                "found_den": found_den,
+                "fit_num": fit_num,
+                "fit_den": fit_den,
+                "found_frac": found_frac,
+                "fit_frac": fit_frac,
+                "pix_shift": pix_shift,
+                "user_shift": user_shift,
+                "z_shift": z_shift,
+                "rms": rms,
+            }
+    return None
+
+
+def append_reidentify_drift(csv_path, stage, target_thar, reference_thar, metrics):
+    """Append one ecreidentify drift/quality row to CSV."""
+    if not csv_path:
+        return
+
+    fieldnames = [
+        "stage", "target_thar", "reference_thar", "image",
+        "found_num", "found_den", "fit_num", "fit_den",
+        "found_frac", "fit_frac", "pix_shift", "user_shift", "z_shift", "rms",
+    ]
+
+    row = {
+        "stage": stage,
+        "target_thar": target_thar,
+        "reference_thar": reference_thar,
+        "image": "",
+        "found_num": "",
+        "found_den": "",
+        "fit_num": "",
+        "fit_den": "",
+        "found_frac": "",
+        "fit_frac": "",
+        "pix_shift": "",
+        "user_shift": "",
+        "z_shift": "",
+        "rms": "",
+    }
+    if metrics:
+        row.update({k: metrics.get(k, "") for k in fieldnames if k in metrics})
+
+    write_header = not os.path.exists(csv_path)
+    with open(csv_path, "a", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def evaluate_reidentify_quality(metrics, min_found_frac, min_fit_frac, max_rms):
+    """Evaluate ecreidentify summary metrics against quality thresholds."""
+    if not metrics:
+        return False, ["missing ecreidentify summary metrics"]
+
+    failures = []
+
+    found_frac = metrics.get("found_frac")
+    if found_frac is None:
+        failures.append("found fraction unavailable")
+    elif found_frac < min_found_frac:
+        failures.append(f"found_frac={found_frac:.3f} < {min_found_frac:.3f}")
+
+    fit_frac = metrics.get("fit_frac")
+    if fit_frac is None:
+        failures.append("fit fraction unavailable")
+    elif fit_frac < min_fit_frac:
+        failures.append(f"fit_frac={fit_frac:.3f} < {min_fit_frac:.3f}")
+
+    rms = metrics.get("rms")
+    if rms is None:
+        failures.append("rms unavailable")
+    elif rms > max_rms:
+        failures.append(f"rms={rms:.3f} > {max_rms:.3f}")
+
+    return (len(failures) == 0), failures
+
+
+def ensure_wavelength_db_aliases(thar_path, source_db):
+    """Populate expected DB alias names for a resolved reference ThAr solution."""
+    if not source_db or not os.path.exists(source_db):
+        return
+
+    src_abs = os.path.abspath(source_db)
+    for candidate in wavelength_db_candidates(thar_path):
+        if os.path.exists(candidate):
+            continue
+        try:
+            os.symlink(src_abs, candidate)
+        except OSError:
+            shutil.copy2(source_db, candidate)
 
 
 def _review_reidentified_lines(thar_ec, coordlist):
     """Offer an interactive review pass for reidentified ThAr line IDs."""
-    if not sys.stdin.isatty():
-        print(
-            f"  review: non-interactive mode; skipping manual line-ID review for {thar_ec}"
+    iraf_image = iraf_spec_token(thar_ec)
+    fully_interactive = (
+        sys.stdin.isatty() and
+        sys.stdout.isatty() and
+        sys.stderr.isatty()
+    )
+    if not fully_interactive:
+        raise RuntimeError(
+            "Step 9 review is required after successful reidentify, "
+            f"but no interactive TTY is available for {thar_ec}."
         )
-        return
-
-    answer = input(
-        f"  Review reidentified lines for {thar_ec}? [Y/n]: "
-    ).strip().lower()
-    if answer in {"n", "no"}:
-        print(f"  review skipped: {thar_ec}")
-        return
 
     print(
         "  Opening ecidentify review for reidentified spectrum.\n"
-        "  Inspect line IDs/residuals, then quit back to continue Step 9."
+        "  Inspect line IDs/residuals, then quit back to continue Step 9.\n"
+        f"  review target: file={thar_ec}, iraf={iraf_image}"
     )
     iraf.noao.echelle.ecidentify.unlearn()
     iraf.noao.echelle.ecidentify(
-        images    = thar_ec,
+        images    = iraf_image,
         database  = "database",
         coordlist = coordlist,
         units     = "",
         match     = 1.0,
-        maxfeatur = 1000,
+        maxfeatur = 100,
         zwidth    = 10.0,
         ftype     = "emission",
         fwidth    = 4.0,
@@ -1307,15 +1578,20 @@ def _resolve_reuse_reference_thar(reference_thar):
             f"for reference ThAr '{ref_path}'. Checked: {', '.join(db_candidates)}"
         )
 
-    print(f"  reuse reference ThAr : {ref_path}")
+    ensure_wavelength_db_aliases(ref_path, found_db)
+    ref_token = os.path.basename(ref_path)
+    ensure_wavelength_db_aliases(ref_token, found_db)
+
+    print(f"  reuse reference ThAr : {ref_token}")
     print(f"  reuse wavelength DB  : {found_db}")
-    return ref_path
+    return ref_token
 
 
 def manual_wavelength_identification(crr2_outputs, thar_outputs,
                                      coordlist="linelists$thar.dat",
                                      step8_mode="ask",
-                                     step8_reference_thar=None):
+                                     step8_reference_thar=None,
+                                     drift_log_path=None):
     """
     Step 8: Reference-star wavelength setup (manual or reuse mode).
 
@@ -1369,7 +1645,12 @@ def manual_wavelength_identification(crr2_outputs, thar_outputs,
         print(
             "  reuse mode: ecreidentify on reference star using existing identified ThAr"
         )
-        _ecreidentify_thar(thar_ec_ref, ref_thar_external)
+        _ecreidentify_thar(
+            thar_ec_ref,
+            ref_thar_external,
+            drift_log_path=drift_log_path,
+            drift_stage="step8_reuse",
+        )
 
     # 8b – refspec: attach ThAr solution to the reference object
     _refspec_one(obj_crr2_ref, thar_ec_ref)
@@ -1378,58 +1659,148 @@ def manual_wavelength_identification(crr2_outputs, thar_outputs,
 
 
 def auto_wavelength_propagation(crr2_outputs, thar_outputs, ref_star,
-                                coordlist="linelists$thar.dat"):
-    """
-    Step 9: Automatic line-ID propagation and review to remaining stars.
-
-    Uses ecreidentify to propagate the solution from ref_star to all other
-    stars, offers a review pass for reidentified ThAr spectra, then uses
-    refspec to assign those IDs to object spectra.
-
-    Parameters
-    ----------
-    crr2_outputs : {star_number: path, ...}
-        CR-cleaned object spectra from step 7.
-    thar_outputs : {star_number: path, ...}
-        ThAr spectra from step 6 (same aperture selection as objects).
-    ref_star     : int
-        Reference star number (should have been calibrated in step 8).
-
-    Returns
-    -------
-    id_assigned_outputs : {star_number: path, ...}
-        Object spectra with ThAr line IDs assigned via refspec (in-place).
-    """
+                                coordlist="linelists$thar.dat",
+                                drift_log_path=None,
+                                step9_gate_mode="warn",
+                                step9_min_found_frac=0.05,
+                                step9_min_fit_frac=0.05,
+                                step9_max_rms=0.30,
+                                star_geometry=None,
+                                step5_geometry_path=None,
+                                extraction_pairs_path=None):
+    """Step 9: automatic line-ID propagation and required review for non-reference stars."""
     section_banner("Step 9 – Automatic line-ID propagation (ecreidentify + review + refspec)")
     iraf.noao()
     iraf.echelle()
     iraf.onedspec()
 
     thar_ec_ref = thar_outputs[ref_star]
-    id_assigned_outputs = {}
+    master_ref_apertures = _read_apertures_from_apnum_cards(thar_ec_ref)
+    if not master_ref_apertures:
+        raise RuntimeError(
+            f"Could not read APNUM apertures from master reference ThAr: {thar_ec_ref}"
+        )
 
-    for star in sorted(crr2_outputs.keys()):
+    id_assigned_outputs = {}
+    failed_gate_stars = []
+
+    if step9_gate_mode != "off":
+        print(
+            "  Step 9 gate: "
+            f"mode={step9_gate_mode}, "
+            f"min_found_frac={step9_min_found_frac:.3f}, "
+            f"min_fit_frac={step9_min_fit_frac:.3f}, "
+            f"max_rms={step9_max_rms:.3f}"
+        )
+
+    star_order = star_order_by_distance_from_reference(
+        star_geometry,
+        ref_star,
+        list(crr2_outputs.keys()),
+    )
+    print(
+        "  Step 9 order: "
+        + ", ".join(f"{int(s):02d}" for s in star_order)
+        + " (nearest in y to reference when geometry is available)"
+    )
+
+    for star in star_order:
         obj_crr2 = crr2_outputs[star]
-        thar_ec  = thar_outputs[star]
+        thar_ec = thar_outputs[star]
 
         print(f"\n  -- Star {star:02d}")
         print(f"     object : {obj_crr2}")
         print(f"     thar   : {thar_ec}")
         print(f"     output : {obj_crr2}  (line IDs assigned in-place)")
 
-        # For reference star, use existing solution (already identified in step 8)
         if star == ref_star:
-            print(f"     (reference star — solution from step 8)")
+            print("     (reference star — solution from step 8)")
         else:
-            # 9a – ecreidentify: propagate solution from reference star
-            _ecreidentify_thar(thar_ec, thar_ec_ref)
-            # 9b – review: inspect reidentified lines before assignment
-            _review_reidentified_lines(thar_ec, coordlist=coordlist)
+            target_apertures, aperture_source = get_target_aperture_numbers(
+                star,
+                thar_ec,
+                geometry_path=step5_geometry_path,
+                extraction_pairs_path=extraction_pairs_path,
+            )
+            print(f"     real target file : {os.path.basename(thar_ec)}")
+            print(f"     target apertures : {target_apertures} (source={aperture_source})")
+            print(f"     master apertures : {master_ref_apertures}")
 
-        # 9c – refspec: attach ThAr solution to the CR-cleaned object
+            prep = None
+            gate_failed = False
+            try:
+                prep = _prepare_temp_target_for_reidentify(
+                    thar_ec_ref,
+                    thar_ec,
+                    star,
+                    target_apertures,
+                )
+                print(f"     temp target file : {prep['temp_target_path']}")
+                print(
+                    "     target->master   : "
+                    f"{_format_aperture_mapping(prep['target_to_master'])}"
+                )
+
+                metrics = _ecreidentify_thar(
+                    prep["temp_target_path"],
+                    thar_ec_ref,
+                    drift_log_path=drift_log_path,
+                    drift_stage="step9_propagation",
+                )
+
+                if step9_gate_mode != "off":
+                    gate_ok, failures = evaluate_reidentify_quality(
+                        metrics,
+                        min_found_frac=step9_min_found_frac,
+                        min_fit_frac=step9_min_fit_frac,
+                        max_rms=step9_max_rms,
+                    )
+                    if gate_ok:
+                        print("     gate: PASS")
+                    else:
+                        failure_text = "; ".join(failures)
+                        print(f"     gate: FAIL ({failure_text})")
+                        print("     gate action: skipping review/refspec for this star")
+                        failed_gate_stars.append(star)
+                        gate_failed = True
+
+                if not gate_failed:
+                    print("     review start     : ecidentify on temporary target")
+                    _review_reidentified_lines(prep["temp_target_path"], coordlist=coordlist)
+                    print("     review end       : ecidentify complete")
+
+                    transfer = _transfer_reviewed_temp_target_solution_to_real_target(
+                        prep["temp_target_path"],
+                        thar_ec,
+                        prep["master_to_target"],
+                    )
+                    print(
+                        "     db transfer      : "
+                        f"{os.path.basename(transfer['temp_db_path'])} -> "
+                        f"{os.path.basename(transfer['real_db_path'])}"
+                    )
+            finally:
+                if prep is not None:
+                    removed, failed = _cleanup_temporary_reference_artifacts(
+                        prep["temp_target_path"],
+                        prep["cleanup_db_candidates"],
+                    )
+                    if failed:
+                        print(f"     cleanup status   : WARN ({'; '.join(failed)})")
+                    else:
+                        print(f"     cleanup status   : OK ({len(removed)} temporary files removed)")
+
+            if gate_failed:
+                continue
+
+        print("     step9 sequence: applying refspec")
         _refspec_one(obj_crr2, thar_ec)
-
         id_assigned_outputs[star] = obj_crr2
+
+    if failed_gate_stars:
+        failed_text = ", ".join(f"{s:02d}" for s in failed_gate_stars)
+        print(f"\n  Step 9 gate skipped stars: {failed_text}")
+        print("  These stars need manual fallback (step 8-style identification path).")
 
     return id_assigned_outputs
 
@@ -1460,26 +1831,22 @@ def parse_args():
               3. Normalised master flat  (fmedian -> imarith -> imreplace)
               4. ccdproc flat-correction  ->  *-sl-F.fits
               5. Interactive aperture-trace preview on traced quartz reference
-              6. Per-star apall extraction  ->  *_star<N>_ec.fits
+              6. Per-star extraction with accepted pattern  ->  *_starNN_ec.fits
               7. Second CR removal (lineclean)  ->  *_ec-crr2.fits
-              8. Reference-star setup (ask/manual ecidentify or reuse via ecreidentify)
-              9. Automatic line-ID propagation (ecreidentify + review + refspec)
-
-                        Optional preprocessing prelude:
-                            Use --run-preprocess to execute image_processing.py in --input-dir
-                            before echelle steps. This prelude is skipped automatically for
-                            late-step reruns (start-step > 1).
-
-                        Modular execution:
-                            Use --start-step/--end-step to run a contiguous step range.
-                            Strict mode: skipped prerequisite steps are not auto-run; their
-                            expected output files must already exist on disk.
+              8. Reference-star wavelength setup (manual/reuse)
+              9. Automatic wavelength propagation + review + refspec
         """),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--quartz",   help="Quartz mosaic FITS (manual override).")
-    p.add_argument("--thar",     help="ThArThNe arc mosaic FITS (manual override).")
-    p.add_argument("--object",   help="Stacked science mosaic FITS (manual override).")
+
+    p.add_argument("--quartz", help="Quartz mosaic FITS (manual override).")
+    p.add_argument(
+        "--quartz-reference",
+        default=None,
+        help="Use this traced quartz reference FITS for steps 5-6 instead of auto alias.",
+    )
+    p.add_argument("--thar", help="ThAr mosaic FITS (manual override).")
+    p.add_argument("--object", help="Science object mosaic FITS (manual override).")
     p.add_argument("--twilight", help="Twilight sky mosaic FITS (manual override).")
     p.add_argument("--input-dir", default=".",
                    help="Directory to scan for auto-discovery (default: .).")
@@ -1501,13 +1868,13 @@ def parse_args():
                    help="Substring filter applied to auto-discovered science OBJECT.")
     p.add_argument("--yes", action="store_true",
                    help="Continue despite metadata mismatch warnings.")
-    p.add_argument("--nstars",   type=int,   default=4,
-                   help="Number of unique stars in the pattern (default: 4).")
-    p.add_argument("--sep",      type=float, default=5.0,
-                   help="Approx. spatial separation between apertures in px (default: 5).")
-    p.add_argument("--nap",      type=int,   default=None,
+    p.add_argument("--nstars", type=int, default=24,
+                   help="Number of unique stars in the pattern (default: 24).")
+    p.add_argument("--sep", type=float, default=8.0,
+                   help="Approx. spatial separation between apertures in px (default: 8).")
+    p.add_argument("--nap", type=int, default=None,
                    help="Total apertures expected (default: IRAF auto-detect).")
-    p.add_argument("--dispaxis", type=int,   default=1, choices=[1, 2],
+    p.add_argument("--dispaxis", type=int, default=1, choices=[1, 2],
                    help="Dispersion axis: 1=columns, 2=rows (default: 1).")
     p.add_argument("--start-step", type=int, default=1, choices=[1, 2, 3, 4, 5, 6, 7, 8, 9],
                    help="First pipeline step to execute (default: 1).")
@@ -1536,6 +1903,42 @@ def parse_args():
             "A matching IRAF DB entry in ./database must exist."
         ),
     )
+    p.add_argument(
+        "--drift-log",
+        default=None,
+        help=(
+            "CSV path for ecreidentify drift metrics (steps 8/9). "
+            "Default: reidentify_drift_<NIGHT>_<SHOE>.csv when night/shoe are set, "
+            "otherwise reidentify_drift.csv."
+        ),
+    )
+    p.add_argument(
+        "--step9-gate-mode",
+        default="warn",
+        choices=["off", "warn", "strict"],
+        help=(
+            "Step-9 quality gate behavior: off (disabled), warn (report failures), "
+            "strict (skip refspec assignment for failed stars)."
+        ),
+    )
+    p.add_argument(
+        "--step9-min-found-frac",
+        type=float,
+        default=0.05,
+        help="Step-9 minimum accepted ecreidentify found fraction (default: 0.05).",
+    )
+    p.add_argument(
+        "--step9-min-fit-frac",
+        type=float,
+        default=0.05,
+        help="Step-9 minimum accepted ecreidentify fit fraction (default: 0.05).",
+    )
+    p.add_argument(
+        "--step9-max-rms",
+        type=float,
+        default=0.30,
+        help="Step-9 maximum accepted ecreidentify RMS (default: 0.30).",
+    )
     p.add_argument("--no-cr", action="store_true",
                    help="Skip step-7 CR removal (keep step-6 *_ec.fits as-is).")
     return p.parse_args()
@@ -1553,12 +1956,9 @@ def selected_steps_from_args(args):
 
 def required_roles_for_steps(selected_steps):
     """Return base input roles required for the selected step range.
-    
-    Steps 5-9 operate on outputs of earlier steps, so they don't require
-    base role discovery:
-      - Step 5: requires step 2 output (quartz_sl), checked separately
-      - Step 6: requires step 4 outputs (obj_ff, thar_ff), checked separately
-      - Steps 7-9: require outputs from step 6 or earlier
+
+        Late-step runs still need enough base context to reconstruct deterministic
+        intermediate filenames from existing artifacts on disk.
     """
     steps = set(selected_steps)
     roles = set()
@@ -1569,18 +1969,38 @@ def required_roles_for_steps(selected_steps):
         roles.update(("quartz", "thar", "object", "twilight"))
     if 4 in steps:
         roles.update(("quartz", "thar", "object", "twilight"))
+    if 5 in steps:
+        roles.add("quartz")
+    if 6 in steps:
+        roles.update(("thar", "object"))
 
     return tuple(r for r in ("quartz", "thar", "object", "twilight") if r in roles)
 
 
-def expected_step2_outputs(quartz, thar, obj, twilight):
+def _normalize_step2_like_input(path):
+    """Normalize a path to the corresponding step-2 '*-sl.fits' artifact."""
+    if not path:
+        return None
+    lower = path.lower()
+    if lower.endswith("-sl.fits"):
+        return path
+    if lower.endswith("-sl-f.fits"):
+        return path[:-7] + ".fits"
+    return stem(path) + "-sl.fits"
+
+
+def expected_step2_outputs(quartz, thar, obj, twilight=None):
     """Return deterministic step-2 output paths for all roles."""
-    return {
-        "quartz_sl": stem(quartz) + "-sl.fits",
-        "thar_sl": stem(thar) + "-sl.fits",
-        "obj_sl": stem(obj) + "-sl.fits",
-        "twilight_sl": stem(twilight) + "-sl.fits",
-    }
+    outputs = {}
+    if quartz:
+        outputs["quartz_sl"] = _normalize_step2_like_input(quartz)
+    if thar:
+        outputs["thar_sl"] = _normalize_step2_like_input(thar)
+    if obj:
+        outputs["obj_sl"] = _normalize_step2_like_input(obj)
+    if twilight:
+        outputs["twilight_sl"] = _normalize_step2_like_input(twilight)
+    return outputs
 
 
 def expected_master_flat(quartz_sl):
@@ -1670,31 +2090,119 @@ def prepare_quartz_reference_alias(quartz_path, meta_by_role,
     return alias_path
 
 
+def rewrite_quartz_db_image_identity(db_path, alias_quartz):
+    """Rewrite IRAF aperture DB image tags so alias references resolve cleanly."""
+    if not os.path.exists(db_path):
+        return
+
+    alias_base = stem(alias_quartz)
+
+    with open(db_path, "r") as fh:
+        lines = fh.readlines()
+
+    changed = False
+    rewritten = []
+    for line in lines:
+        stripped = line.lstrip()
+        if stripped.startswith("begin") and "aperture" in stripped:
+            m = re.match(r"^(\s*begin\s+aperture\s+)\S+(\s+.*)$", line)
+            if m:
+                replacement = f"{m.group(1)}./{alias_base}{m.group(2)}\n"
+                if line != replacement:
+                    line = replacement
+                    changed = True
+        if stripped.startswith("image"):
+            indent = line[:len(line) - len(stripped)]
+            replacement = f"{indent}image\t./{alias_base}\n"
+            if line != replacement:
+                line = replacement
+                changed = True
+        rewritten.append(line)
+
+    if changed:
+        with open(db_path, "w") as fh:
+            fh.writelines(rewritten)
+
+
+def _trace_source_from_step2_like(quartz_path):
+    """Return likely traced-quartz path when input is a step-2/4 quartz product."""
+    if not quartz_path:
+        return None
+    lower = quartz_path.lower()
+    if lower.endswith("-sl-f.fits"):
+        return quartz_path[:-10] + ".fits"
+    if lower.endswith("-sl.fits"):
+        return quartz_path[:-7] + ".fits"
+    return None
+
+
 def ensure_quartz_trace_db_alias(source_quartz, alias_quartz):
-    """Ensure alias quartz has aperture DB by linking/copying source DB."""
+    """Ensure alias quartz has aperture DB with alias-consistent image identity."""
     alias_candidates = quartz_trace_db_candidates(alias_quartz)
-    for candidate in alias_candidates:
-        if os.path.exists(candidate):
-            return candidate
+    existing_alias = [p for p in alias_candidates if os.path.exists(p)]
 
     source_db = None
     for candidate in quartz_trace_db_candidates(source_quartz):
         if os.path.exists(candidate):
             source_db = candidate
             break
+
+    if source_db is None:
+        traced_source = _trace_source_from_step2_like(source_quartz)
+        if traced_source:
+            for candidate in quartz_trace_db_candidates(traced_source):
+                if os.path.exists(candidate):
+                    source_db = candidate
+                    break
+
+    # Resume runs often pass --quartz as '*-sl.fits' (which has no trace DB).
+    # Fall back to any existing alias/source trace DB and normalize identity.
+    if source_db is None:
+        for candidate in quartz_trace_db_candidates(alias_quartz):
+            if os.path.exists(candidate):
+                source_db = candidate
+                break
+    if source_db is None and existing_alias:
+        source_db = existing_alias[0]
     if source_db is None:
         return None
 
-    os.makedirs("database", exist_ok=True)
-    target = alias_candidates[0]
-    if os.path.exists(target):
-        return target
+    template_db = source_db
+    if os.path.abspath(source_db) in {os.path.abspath(p) for p in alias_candidates if os.path.lexists(p)}:
+        template_db = os.path.join("database", f"._ap_source_{stem(alias_quartz)}.tmp")
+        shutil.copy2(source_db, template_db)
 
-    try:
-        os.symlink(os.path.abspath(source_db), target)
-    except OSError:
-        shutil.copy2(source_db, target)
-    return target
+    os.makedirs("database", exist_ok=True)
+
+    # Ensure all common IRAF DB naming variants exist for the alias and point
+    # to alias image identity (IRAF checks DB image tags during extraction).
+    for target in alias_candidates:
+        if os.path.exists(target) and os.path.islink(target):
+            os.unlink(target)
+
+        needs_refresh = (not os.path.exists(target))
+        if not needs_refresh:
+            try:
+                needs_refresh = os.path.getmtime(source_db) > os.path.getmtime(target)
+            except OSError:
+                needs_refresh = True
+
+        if needs_refresh:
+            shutil.copy2(template_db, target)
+
+        rewrite_quartz_db_image_identity(target, alias_quartz)
+
+    if template_db != source_db and os.path.exists(template_db):
+        os.remove(template_db)
+
+    # Return the preferred candidate if present, otherwise any existing alias.
+    for target in alias_candidates:
+        if os.path.exists(target):
+            return target
+    for target in existing_alias:
+        if os.path.exists(target):
+            return target
+    return None
 
 
 def wavelength_db_candidates(thar_path):
@@ -1709,6 +2217,9 @@ def wavelength_db_candidates(thar_path):
         f"{db_dir}/ec{base_name}",
         f"{db_dir}/ec.{base_name}",
         f"{db_dir}/ec_{base_name}",
+        # Compatibility: some historical runs produce ec.ec* style names.
+        f"{db_dir}/ec.ec{base_stem}",
+        f"{db_dir}/ec.ec{base_name}",
     ]
 
     unique = []
@@ -1793,6 +2304,418 @@ def default_affiliation_map_path(meta_by_role, reference_path=None,
     return f"affiliation_{night}_{shoe}.json"
 
 
+def default_geometry_path(meta_by_role, reference_path=None,
+                          fallback_night=None, fallback_shoe=None):
+    """Return default Step-5 geometry filename for the current night+shoe."""
+    night, shoe = infer_night_shoe(
+        meta_by_role,
+        reference_path=reference_path,
+        fallback_night=fallback_night,
+        fallback_shoe=fallback_shoe,
+    )
+    return f"geometry_{night}_{shoe}.json"
+
+
+def _evaluate_iraf_curve(curve_values, ncols):
+    """Evaluate IRAF aperture curve metadata onto detector x-pixel coordinates."""
+    if len(curve_values) < 4:
+        return None
+
+    fit_type = int(round(curve_values[0]))
+    ncoeff = int(round(curve_values[1]))
+    xmin = float(curve_values[2])
+    xmax = float(curve_values[3])
+    if len(curve_values) < 4 + ncoeff:
+        return None
+    coeffs = np.array(curve_values[4: 4 + ncoeff], dtype=float)
+    if len(coeffs) == 0 or xmax == xmin:
+        return None
+
+    lo = max(0.0, min(xmin, xmax))
+    hi = min(float(ncols - 1), max(xmin, xmax))
+    if hi - lo < 1.0:
+        return None
+
+    x_pixels = np.linspace(lo, hi, 220)
+    xnorm = 2.0 * (x_pixels - xmin) / (xmax - xmin) - 1.0
+
+    if fit_type == 2:
+        delta = np.polynomial.chebyshev.chebval(xnorm, coeffs)
+    elif fit_type == 1:
+        delta = np.polynomial.legendre.legval(xnorm, coeffs)
+    else:
+        return None
+    return x_pixels, delta
+
+
+def _load_quartz_trace_details(quartz_path):
+    """Load per-aperture geometry details from IRAF aperture database."""
+    try:
+        from aperture_preview import find_iraf_aperture_db
+    except ImportError:
+        return {"db_path": None, "entries": []}
+
+    if not quartz_path or not os.path.exists(quartz_path):
+        return {"db_path": None, "entries": []}
+
+    data = fits.getdata(quartz_path)
+    ncols = int(data.shape[1])
+    db_path = find_iraf_aperture_db(quartz_path)
+    if not db_path or not os.path.exists(db_path):
+        return {"db_path": None, "entries": []}
+
+    with open(db_path, "r") as fh:
+        lines = fh.readlines()
+
+    entries = []
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        if not line.startswith("begin"):
+            i += 1
+            continue
+
+        parts = line.split()
+        if len(parts) < 4 or parts[1] != "aperture":
+            i += 1
+            continue
+
+        try:
+            ap_num = int(parts[3])
+        except ValueError:
+            i += 1
+            continue
+
+        center_y = None
+        lower = None
+        upper = None
+        curve_values = None
+
+        j = i + 1
+        while j < len(lines):
+            inner = lines[j].strip()
+            if inner.startswith("begin"):
+                break
+
+            if inner.startswith("center"):
+                toks = inner.split()
+                if len(toks) >= 3:
+                    try:
+                        center_y = float(toks[2])
+                    except ValueError:
+                        center_y = None
+            elif inner.startswith("low"):
+                toks = inner.split()
+                try:
+                    lower = float(toks[-1])
+                except (ValueError, IndexError):
+                    lower = None
+            elif inner.startswith("high"):
+                toks = inner.split()
+                try:
+                    upper = float(toks[-1])
+                except (ValueError, IndexError):
+                    upper = None
+            elif inner.startswith("curve"):
+                toks = inner.split()
+                try:
+                    nvals = int(toks[1])
+                except (ValueError, IndexError):
+                    nvals = 0
+
+                vals = []
+                k = j + 1
+                while k < len(lines) and len(vals) < nvals:
+                    probe = lines[k].strip()
+                    if not probe:
+                        k += 1
+                        continue
+                    if probe.startswith("begin"):
+                        break
+                    try:
+                        vals.append(float(probe))
+                    except ValueError:
+                        pass
+                    k += 1
+                if len(vals) == nvals:
+                    curve_values = vals
+            j += 1
+
+        trace_xy = None
+        if curve_values is not None and center_y is not None:
+            evaluated = _evaluate_iraf_curve(curve_values, ncols)
+            if evaluated is not None:
+                x_pixels, delta = evaluated
+                trace_xy = (x_pixels, center_y + delta)
+
+        entries.append(
+            {
+                "aperture": ap_num,
+                "center_y": center_y,
+                "lower": lower,
+                "upper": upper,
+                "trace_coeffs": curve_values,
+                "trace_xy": trace_xy,
+            }
+        )
+        i = j
+
+    entries.sort(key=lambda x: x["aperture"])
+    return {"db_path": db_path, "entries": entries}
+
+
+def _fit_bundle_center_parabolas(aperture_records, ncols):
+    """Fit quadratic bundle-center loci y_b(x) from per-aperture traces."""
+    bundles = {}
+    x_eval = np.linspace(0.0, float(ncols - 1), 50)
+
+    for rec in aperture_records:
+        bundle = rec.get("bundle")
+        trace_xy = rec.get("trace_xy")
+        if bundle is None or trace_xy is None:
+            continue
+        x_trace, y_trace = trace_xy
+        if len(x_trace) < 2:
+            continue
+
+        interp = np.full_like(x_eval, np.nan, dtype=float)
+        mask = (x_eval >= float(np.min(x_trace))) & (x_eval <= float(np.max(x_trace)))
+        if np.any(mask):
+            interp[mask] = np.interp(x_eval[mask], x_trace, y_trace)
+        bundles.setdefault(int(bundle), []).append(interp)
+
+    center_models = []
+    mean_curves = {}
+    for bundle in sorted(bundles):
+        stack = np.array(bundles[bundle], dtype=float)
+        mean_curve = np.nanmean(stack, axis=0)
+        good = np.isfinite(mean_curve)
+        if np.count_nonzero(good) < 3:
+            continue
+        coeff = np.polyfit(x_eval[good], mean_curve[good], deg=2)
+        center_models.append(
+            {
+                "bundle": bundle,
+                "coefficients": [float(coeff[0]), float(coeff[1]), float(coeff[2])],
+                "n_samples": int(np.count_nonzero(good)),
+            }
+        )
+        mean_curves[bundle] = mean_curve
+
+    spacing_models = []
+    sorted_bundles = sorted(mean_curves)
+    for left, right in zip(sorted_bundles[:-1], sorted_bundles[1:]):
+        delta = mean_curves[right] - mean_curves[left]
+        good = np.isfinite(delta)
+        if np.count_nonzero(good) < 3:
+            continue
+        coeff = np.polyfit(x_eval[good], delta[good], deg=2)
+        spacing_models.append(
+            {
+                "bundle_left": int(left),
+                "bundle_right": int(right),
+                "coefficients": [float(coeff[0]), float(coeff[1]), float(coeff[2])],
+                "n_samples": int(np.count_nonzero(good)),
+            }
+        )
+
+    return center_models, spacing_models
+
+
+def save_step5_geometry(path, centers, pattern, quartz_path, meta_by_role):
+    """Persist full Step-5 geometry metadata for downstream modeling."""
+    night, shoe = infer_night_shoe(meta_by_role, reference_path=quartz_path)
+    centers = np.asarray(centers, dtype=float)
+    pattern = np.asarray(pattern, dtype=int)
+
+    trace_details = _load_quartz_trace_details(quartz_path)
+    by_ap = {entry["aperture"]: entry for entry in trace_details["entries"]}
+
+    order_index_by_ap = {}
+    for star in sorted(set(int(s) for s in pattern if int(s) > 0)):
+        ap_indices = list(np.where(pattern == star)[0] + 1)
+        ap_sorted = sorted(ap_indices, key=lambda ap: float(centers[ap - 1]))
+        for idx, ap in enumerate(ap_sorted, start=1):
+            order_index_by_ap[ap] = idx
+
+    sort_idx = np.argsort(centers)
+    gap_prev = np.full(len(centers), np.nan, dtype=float)
+    gap_next = np.full(len(centers), np.nan, dtype=float)
+    sorted_centers = centers[sort_idx]
+    if len(sorted_centers) >= 2:
+        deltas = np.diff(sorted_centers)
+        for pos, ap_i in enumerate(sort_idx):
+            if pos > 0:
+                gap_prev[ap_i] = float(deltas[pos - 1])
+            if pos < len(sorted_centers) - 1:
+                gap_next[ap_i] = float(deltas[pos])
+
+    aperture_records = []
+    for ap_idx in range(len(pattern)):
+        aperture = ap_idx + 1
+        star = int(pattern[ap_idx])
+        bundle = ((star - 1) // 4 + 1) if star > 0 else None
+        star_in_bundle = ((star - 1) % 4 + 1) if star > 0 else None
+        trace = by_ap.get(aperture, {})
+
+        aperture_records.append(
+            {
+                "aperture": aperture,
+                "bundle": bundle,
+                "star": star if star > 0 else None,
+                "star_in_bundle": star_in_bundle,
+                "order": order_index_by_ap.get(aperture),
+                "y_center_ref": float(centers[ap_idx]),
+                "trace_coeffs": trace.get("trace_coeffs"),
+                "lower": trace.get("lower"),
+                "upper": trace.get("upper"),
+                "gap_prev": (None if not np.isfinite(gap_prev[ap_idx]) else float(gap_prev[ap_idx])),
+                "gap_next": (None if not np.isfinite(gap_next[ap_idx]) else float(gap_next[ap_idx])),
+                "status": "active" if star > 0 else "deleted",
+                "trace_xy": trace.get("trace_xy"),
+            }
+        )
+
+    ncols = int(fits.getdata(quartz_path).shape[1])
+    bundle_center_models, bundle_spacing_models = _fit_bundle_center_parabolas(
+        aperture_records,
+        ncols,
+    )
+
+    serializable_apertures = []
+    for rec in aperture_records:
+        trace_xy = rec.pop("trace_xy")
+        if trace_xy is not None:
+            x_trace, y_trace = trace_xy
+            rec["trace_x"] = [float(x) for x in x_trace.tolist()]
+            rec["trace_y"] = [float(y) for y in y_trace.tolist()]
+        else:
+            rec["trace_x"] = None
+            rec["trace_y"] = None
+        serializable_apertures.append(rec)
+
+    payload = {
+        "schema_version": 1,
+        "night": str(night),
+        "shoe": str(shoe),
+        "quartz_path": os.path.basename(quartz_path) if quartz_path else "",
+        "quartz_db_path": trace_details.get("db_path") or "",
+        "n_apertures": int(len(pattern)),
+        "n_active_apertures": int(np.count_nonzero(pattern > 0)),
+        "apertures": serializable_apertures,
+        "bundle_center_parabolas": bundle_center_models,
+        "bundle_spacing_parabolas": bundle_spacing_models,
+    }
+
+    with open(path, "w") as fh:
+        json.dump(payload, fh, indent=2, sort_keys=True)
+    print(f"  Geometry file saved   : {path}")
+
+
+def plot_step5_geometry_png(geometry_path, output_png=None):
+    """Render a static Step-5 geometry PNG for CCD/star inspection."""
+    if not geometry_path or not os.path.exists(geometry_path):
+        return None
+
+    with open(geometry_path, "r") as fh:
+        payload = json.load(fh)
+
+    apertures = payload.get("apertures") or []
+    bundle_center_parabolas = payload.get("bundle_center_parabolas") or []
+    if not apertures:
+        return None
+
+    import matplotlib
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    if output_png is None:
+        output_png = os.path.splitext(geometry_path)[0] + "_ccd_star_geometry.png"
+
+    xmins = []
+    xmaxs = []
+    for rec in apertures:
+        x_vals = rec.get("trace_x")
+        y_vals = rec.get("trace_y")
+        if x_vals is None or y_vals is None:
+            continue
+        if len(x_vals) >= 2 and len(y_vals) >= 2 and len(x_vals) == len(y_vals):
+            xmins.append(float(np.min(x_vals)))
+            xmaxs.append(float(np.max(x_vals)))
+
+    if xmins and xmaxs:
+        x_min = float(np.min(xmins))
+        x_max = float(np.max(xmaxs))
+    else:
+        x_min = 0.0
+        x_max = 2047.0
+
+    if not np.isfinite(x_min) or not np.isfinite(x_max) or x_max <= x_min:
+        x_min, x_max = 0.0, 2047.0
+
+    x_mid = 0.5 * (x_min + x_max)
+    x_plot = np.linspace(x_min, x_max, 512)
+    cmap = plt.get_cmap("tab20")
+
+    fig, ax = plt.subplots(figsize=(12, 7))
+    star_y_values = {}
+
+    for rec in apertures:
+        star = rec.get("star")
+        y_center = rec.get("y_center_ref")
+        trace_x = rec.get("trace_x")
+        trace_y = rec.get("trace_y")
+
+        is_active = isinstance(star, int) and star > 0
+        if is_active:
+            color = cmap((int(star) - 1) % cmap.N)
+            linestyle = "-"
+            if y_center is not None:
+                star_y_values.setdefault(int(star), []).append(float(y_center))
+        else:
+            color = "0.6"
+            linestyle = "--"
+
+        if (
+            trace_x is not None
+            and trace_y is not None
+            and len(trace_x) >= 2
+            and len(trace_y) >= 2
+            and len(trace_x) == len(trace_y)
+        ):
+            ax.plot(trace_x, trace_y, color=color, linestyle=linestyle, linewidth=1.4, alpha=0.9)
+        elif y_center is not None:
+            y = float(y_center)
+            ax.plot([x_min, x_max], [y, y], color=color, linestyle=linestyle, linewidth=1.2, alpha=0.85)
+
+    for model in bundle_center_parabolas:
+        coeff = model.get("coefficients")
+        if not coeff or len(coeff) != 3:
+            continue
+        a, b, c = [float(v) for v in coeff]
+        y_model = a * x_plot * x_plot + b * x_plot + c
+        ax.plot(x_plot, y_model, color="k", linestyle=":", linewidth=1.0, alpha=0.8)
+
+    for star in sorted(star_y_values):
+        y_vals = np.asarray(star_y_values[star], dtype=float)
+        y_med = float(np.median(y_vals))
+        color = cmap((int(star) - 1) % cmap.N)
+        ax.plot([x_mid], [y_med], marker="o", markersize=6, color=color,
+                markeredgecolor="k", markeredgewidth=0.4)
+
+    ax.set_xlabel("CCD X [pix]")
+    ax.set_ylabel("CCD Y [pix]")
+    ax.set_title("Step-5 Geometry: Aperture Traces and Bundle Centers")
+    ax.grid(True, alpha=0.25)
+
+    fig.tight_layout()
+    fig.savefig(output_png, dpi=150)
+    plt.close(fig)
+
+    print(f"  Step-5 geometry PNG : {output_png}")
+    return output_png
+
+
 def save_affiliation_map(path, pattern, quartz_path, meta_by_role):
     """Persist accepted aperture affiliation map from Step 5."""
     night, shoe = infer_night_shoe(meta_by_role, reference_path=quartz_path)
@@ -1822,6 +2745,21 @@ def load_affiliation_map(path):
         return json.load(fh)
 
 
+def _existing_quartz_db_realpaths(quartz_path, extra_db_path=None):
+    """Return canonical realpaths for existing quartz aperture DB candidates."""
+    realpaths = set()
+    candidates = []
+    if quartz_path:
+        candidates.extend(quartz_trace_db_candidates(quartz_path))
+    if extra_db_path:
+        candidates.append(extra_db_path)
+
+    for candidate in candidates:
+        if candidate and os.path.exists(candidate):
+            realpaths.add(os.path.realpath(candidate))
+    return realpaths
+
+
 def validate_affiliation_map(mapping, quartz_path, meta_by_role):
     """Validate persisted mapping against current run metadata."""
     required = {"schema_version", "night", "shoe", "quartz_path", "n_apertures", "pattern"}
@@ -1841,10 +2779,20 @@ def validate_affiliation_map(mapping, quartz_path, meta_by_role):
     if not quartz_path:
         issues.append("missing quartz reference path for map validation")
     elif os.path.basename(str(mapping["quartz_path"])) != os.path.basename(quartz_path):
-        issues.append(
-            "quartz mismatch: "
-            f"map={mapping['quartz_path']} run={os.path.basename(quartz_path)}"
+        map_quartz_name = os.path.basename(str(mapping.get("quartz_path", "")))
+        map_db_realpaths = _existing_quartz_db_realpaths(
+            mapping.get("quartz_path"),
+            extra_db_path=mapping.get("quartz_db_path"),
         )
+        run_db_realpaths = _existing_quartz_db_realpaths(quartz_path)
+        map_is_alias_name = map_quartz_name.startswith("quartz_trace_ref_")
+        if map_is_alias_name and run_db_realpaths:
+            pass
+        elif not map_db_realpaths.intersection(run_db_realpaths):
+            issues.append(
+                "quartz mismatch: "
+                f"map={mapping['quartz_path']} run={os.path.basename(quartz_path)}"
+            )
 
     raw_pattern = np.asarray(mapping["pattern"])
     if raw_pattern.ndim != 1:
@@ -1883,6 +2831,533 @@ def write_extraction_pairs_index(path, obj_outputs, thar_outputs, pattern):
             aperture_str = _aperture_range_string(ap_indices)
             writer.writerow([star, obj_outputs[star], thar_outputs[star], aperture_str])
     print(f"  Extraction pairing index saved: {path}")
+
+
+def default_star_geometry_path(meta_by_role, reference_path=None,
+                               fallback_night=None, fallback_shoe=None):
+    """Return default star-geometry filename for the current night+shoe."""
+    night, shoe = infer_night_shoe(
+        meta_by_role,
+        reference_path=reference_path,
+        fallback_night=fallback_night,
+        fallback_shoe=fallback_shoe,
+    )
+    return f"star_geometry_{night}_{shoe}.json"
+
+
+def save_star_geometry_table(path, pattern, quartz_path, obj_outputs, thar_outputs, meta_by_role):
+    """Persist per-star geometry table with y_star and linked extraction outputs."""
+    night, shoe = infer_night_shoe(meta_by_role, reference_path=quartz_path)
+    pattern = np.asarray(pattern, dtype=int)
+
+    trace_details = _load_quartz_trace_details(quartz_path)
+    centers_by_ap = {}
+    for entry in trace_details.get("entries", []):
+        ap = int(entry.get("aperture", 0))
+        center_y = entry.get("center_y")
+        if ap > 0 and center_y is not None:
+            centers_by_ap[ap] = float(center_y)
+
+    stars = sorted(set(obj_outputs).intersection(set(thar_outputs)))
+    records = []
+    for star in stars:
+        ap_indices = list(np.where(pattern == star)[0] + 1)
+        order_centers = [centers_by_ap[ap] for ap in ap_indices if ap in centers_by_ap]
+        if not order_centers:
+            continue
+        order_centers = sorted(float(v) for v in order_centers)
+        y_star = float(np.median(order_centers))
+        bundle = ((int(star) - 1) // 4) + 1
+        records.append(
+            {
+                "star_id": int(star),
+                "bundle": int(bundle),
+                "y_star": y_star,
+                "order_centers": order_centers,
+                "thar_ec": thar_outputs[star],
+                "object_ec": obj_outputs[star],
+            }
+        )
+
+    payload = {
+        "schema_version": 1,
+        "night": str(night),
+        "shoe": str(shoe),
+        "quartz_path": os.path.basename(quartz_path) if quartz_path else "",
+        "n_stars": len(records),
+        "stars": records,
+    }
+    with open(path, "w") as fh:
+        json.dump(payload, fh, indent=2, sort_keys=True)
+    print(f"  Star geometry saved  : {path}")
+
+
+def load_star_geometry_table(path):
+    """Load star-geometry table from disk."""
+    with open(path, "r") as fh:
+        return json.load(fh)
+
+
+def star_order_by_distance_from_reference(star_geometry, ref_star, available_stars):
+    """Return stars ordered by increasing |y_star - y_ref| when geometry exists."""
+    if not star_geometry:
+        return sorted(available_stars)
+
+    stars = star_geometry.get("stars", [])
+    y_by_star = {}
+    for rec in stars:
+        try:
+            y_by_star[int(rec["star_id"])] = float(rec["y_star"])
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    if ref_star not in y_by_star:
+        return sorted(available_stars)
+
+    y_ref = y_by_star[ref_star]
+    with_y = [s for s in available_stars if s in y_by_star]
+    without_y = [s for s in available_stars if s not in y_by_star]
+    with_y_sorted = sorted(with_y, key=lambda s: (abs(y_by_star[s] - y_ref), s))
+    return with_y_sorted + sorted(without_y)
+
+
+def _expand_aperture_range_string(aperture_text):
+    """Expand compact aperture ranges like '1-3,8' to sorted integer list."""
+    result = []
+    text = str(aperture_text or "").strip()
+    if not text:
+        return result
+
+    for chunk in text.split(","):
+        token = chunk.strip()
+        if not token:
+            continue
+        if "-" in token:
+            try:
+                left, right = token.split("-", 1)
+                lo = int(left.strip())
+                hi = int(right.strip())
+            except ValueError:
+                continue
+            if lo <= hi:
+                result.extend(range(lo, hi + 1))
+            else:
+                result.extend(range(hi, lo + 1))
+        else:
+            try:
+                result.append(int(token))
+            except ValueError:
+                continue
+    return sorted(set(result))
+
+
+def _first_int_in_text(value):
+    """Return first integer token found in value, otherwise None."""
+    m = re.search(r"[-+]?\d+", str(value))
+    if not m:
+        return None
+    return int(m.group(0))
+
+
+def _replace_first_integer(value, new_int):
+    """Replace the first integer token in value with new_int."""
+    text = str(value)
+    m = re.search(r"[-+]?\d+", text)
+    if not m:
+        return text
+    return text[:m.start()] + str(int(new_int)) + text[m.end():]
+
+
+def _read_apertures_from_geometry_file(geometry_path, target_star):
+    """Read target star aperture numbers from persisted step-5 geometry."""
+    if not geometry_path or not os.path.exists(geometry_path):
+        return []
+
+    try:
+        with open(geometry_path, "r") as fh:
+            payload = json.load(fh)
+    except Exception:
+        return []
+
+    apertures = []
+    for rec in payload.get("apertures", []):
+        try:
+            if int(rec.get("star")) != int(target_star):
+                continue
+            apertures.append(int(rec.get("aperture")))
+        except (TypeError, ValueError):
+            continue
+    return sorted(set(apertures))
+
+
+def _read_apertures_from_extraction_pairs(extraction_pairs_path, target_star):
+    """Read target star apertures from extraction_pairs_<NIGHT>_<SHOE>.csv."""
+    if not extraction_pairs_path or not os.path.exists(extraction_pairs_path):
+        return []
+
+    try:
+        with open(extraction_pairs_path, "r", newline="") as fh:
+            reader = csv.DictReader(fh)
+            for row in reader:
+                try:
+                    if int(row.get("star")) != int(target_star):
+                        continue
+                except (TypeError, ValueError):
+                    continue
+                apertures = _expand_aperture_range_string(row.get("apertures", ""))
+                if apertures:
+                    return apertures
+    except Exception:
+        return []
+
+    return []
+
+
+def _read_apertures_from_apnum_cards(fits_path):
+    """Read aperture numbers from APNUM* cards in an extracted multispec FITS."""
+    if not fits_path or not os.path.exists(fits_path):
+        return []
+
+    try:
+        hdr = fits.getheader(fits_path)
+    except Exception:
+        return []
+
+    apertures = []
+    for key in hdr.keys():
+        if not re.match(r"APNUM\d+$", str(key)):
+            continue
+        raw = hdr[key]
+        ap = _first_int_in_text(raw)
+        if ap is None:
+            ap = _first_int_in_text(str(key)[5:])
+        if ap is not None:
+            apertures.append(int(ap))
+
+    return sorted(set(apertures))
+
+
+def get_target_aperture_numbers(target_star, target_thar_path,
+                                geometry_path=None, extraction_pairs_path=None):
+    """Resolve target aperture numbers, preferring geometry mapping when available."""
+    apertures = _read_apertures_from_geometry_file(geometry_path, target_star)
+    source = "step5-geometry"
+    if not apertures:
+        apertures = _read_apertures_from_extraction_pairs(extraction_pairs_path, target_star)
+        source = "extraction-pairs"
+    if not apertures:
+        apertures = _read_apertures_from_apnum_cards(target_thar_path)
+        source = "APNUM"
+
+    if not apertures:
+        raise RuntimeError(
+            f"Could not resolve aperture numbers for target star {int(target_star):02d}. "
+            f"Tried geometry={geometry_path}, extraction_pairs={extraction_pairs_path}, "
+            f"APNUM from {target_thar_path}."
+        )
+    return sorted(apertures), source
+
+
+def _build_aperture_mapping(master_apertures, target_apertures, expected_count=4):
+    """Build one-to-one mapping from master reference apertures to target apertures."""
+    master = sorted(int(v) for v in master_apertures)
+    target = sorted(int(v) for v in target_apertures)
+
+    if len(master) != len(target):
+        raise RuntimeError(
+            "Master/target aperture count mismatch for temporary reference remapping: "
+            f"master={master}, target={target}."
+        )
+    if expected_count is not None and len(target) != int(expected_count):
+        raise RuntimeError(
+            f"Expected {int(expected_count)} apertures for target remapping, "
+            f"got {len(target)} for target={target}."
+        )
+    if len(set(master)) != len(master) or len(set(target)) != len(target):
+        raise RuntimeError(
+            f"Aperture mapping requires unique aperture IDs. master={master}, target={target}."
+        )
+
+    return {int(src): int(dst) for src, dst in zip(master, target)}
+
+
+def _format_aperture_mapping(aperture_mapping):
+    """Return compact human-readable mapping string (e.g. '1->5, 2->6')."""
+    return ", ".join(
+        f"{int(src)}->{int(dst)}"
+        for src, dst in sorted(aperture_mapping.items())
+    )
+
+
+def _create_temporary_reference_fits(master_ref_thar, target_star):
+    """Create a fresh per-target temporary FITS copy from master reference."""
+    nonce = os.urandom(3).hex()
+    tmp_name = f".tmp_ref_star{int(target_star):02d}_{os.getpid()}_{nonce}.fits"
+    tmp_path = os.path.join(".", tmp_name)
+    shutil.copy2(master_ref_thar, tmp_path)
+    return tmp_path
+
+
+def _create_temporary_target_fits(target_thar, target_star):
+    """Create a fresh per-target temporary FITS copy from real target ThAr."""
+    nonce = os.urandom(3).hex()
+    tmp_name = f".tmp_tgt_star{int(target_star):02d}_{os.getpid()}_{nonce}.fits"
+    tmp_path = os.path.join(".", tmp_name)
+    shutil.copy2(target_thar, tmp_path)
+    return tmp_path
+
+
+def _resolve_master_reference_db(master_ref_thar):
+    """Resolve the existing master wavelength DB record for a reference ThAr."""
+    probes = [master_ref_thar, os.path.basename(master_ref_thar), stem(master_ref_thar)]
+    for probe in probes:
+        found_db, _candidates = resolve_existing_wavelength_db(probe)
+        if found_db:
+            return found_db
+    raise RuntimeError(
+        f"Could not resolve master wavelength DB record for reference ThAr: {master_ref_thar}"
+    )
+
+
+def _clone_temporary_reference_db(master_ref_thar, temp_ref_path):
+    """Clone master wavelength DB record to temp reference DB entry."""
+    master_db = _resolve_master_reference_db(master_ref_thar)
+    temp_candidates = wavelength_db_candidates(temp_ref_path)
+    if not temp_candidates:
+        raise RuntimeError(f"No DB candidates available for temporary reference: {temp_ref_path}")
+
+    temp_db = temp_candidates[0]
+    os.makedirs(os.path.dirname(temp_db) or ".", exist_ok=True)
+    shutil.copy2(master_db, temp_db)
+    return temp_db, master_db, temp_candidates
+
+
+def _wat2_keys_sorted(header):
+    """Return WAT2_* header keys sorted by numeric suffix."""
+    keys = [k for k in header.keys() if re.match(r"WAT2_\d+$", str(k))]
+    return sorted(keys, key=lambda k: int(str(k).split("_")[1]))
+
+
+def _renumber_wat2_payload(payload, aperture_mapping):
+    """Renumber multispec WAT2 spec aperture IDs using aperture mapping."""
+    def _replace_spec(match):
+        content = match.group(2)
+        old_ap = _first_int_in_text(content)
+        if old_ap is None or old_ap not in aperture_mapping:
+            return match.group(0)
+        new_content = _replace_first_integer(content, aperture_mapping[old_ap])
+        return f"{match.group(1)}{new_content}{match.group(3)}"
+
+    return re.sub(r'(spec\d+\s*=\s*")([^\"]+)(")', _replace_spec, payload)
+
+
+def _renumber_temporary_reference_fits(temp_ref_path, aperture_mapping):
+    """Apply aperture remapping to APNUM* and WAT2 metadata in temp FITS copy."""
+    with fits.open(temp_ref_path, mode="update") as hdul:
+        hdr = hdul[0].header
+
+        for key in list(hdr.keys()):
+            if not re.match(r"APNUM\d+$", str(key)):
+                continue
+            raw_value = str(hdr[key])
+            old_ap = _first_int_in_text(raw_value)
+            if old_ap is None:
+                old_ap = _first_int_in_text(str(key)[5:])
+            if old_ap in aperture_mapping:
+                hdr[key] = _replace_first_integer(raw_value, aperture_mapping[old_ap])
+
+        wat_keys = _wat2_keys_sorted(hdr)
+        if wat_keys:
+            old_payload = "".join(str(hdr[k]) for k in wat_keys)
+            new_payload = _renumber_wat2_payload(old_payload, aperture_mapping)
+            if new_payload != old_payload:
+                chunk_size = 68
+                chunks = [new_payload[i:i + chunk_size] for i in range(0, len(new_payload), chunk_size)]
+                if not chunks:
+                    chunks = [""]
+                for idx, chunk in enumerate(chunks, start=1):
+                    hdr[f"WAT2_{idx:03d}"] = chunk
+                for key in wat_keys:
+                    if int(str(key).split("_")[1]) > len(chunks):
+                        del hdr[key]
+
+
+def _renumber_temporary_reference_db(temp_db_path, temp_ref_path, aperture_mapping):
+    """Apply identical aperture remapping to temporary wavelength DB record."""
+    tmp_image_token = iraf_spec_token(temp_ref_path)
+    with open(temp_db_path, "r") as fh:
+        lines = fh.readlines()
+
+    rewritten = []
+    for line in lines:
+        raw = line.rstrip("\n")
+        newline = "\n" if line.endswith("\n") else ""
+        stripped = raw.strip()
+
+        if stripped.startswith("image"):
+            indent = raw[:len(raw) - len(raw.lstrip())]
+            rewritten.append(f"{indent}image\t{tmp_image_token}{newline}")
+            continue
+
+        m_begin_ap = re.match(r"^(\s*begin\s+\S+\s+)(\S+)(\s+)(-?\d+)(\s*)$", raw)
+        if m_begin_ap:
+            old_ap = int(m_begin_ap.group(4))
+            new_ap = aperture_mapping.get(old_ap, old_ap)
+            rewritten.append(
+                f"{m_begin_ap.group(1)}{tmp_image_token}{m_begin_ap.group(3)}{new_ap}{m_begin_ap.group(5)}{newline}"
+            )
+            continue
+
+        m_begin = re.match(r"^(\s*begin\s+\S+\s+)(\S+)(\s*)$", raw)
+        if m_begin:
+            rewritten.append(
+                f"{m_begin.group(1)}{tmp_image_token}{m_begin.group(3)}{newline}"
+            )
+            continue
+
+        m_ap = re.match(r"^(\s*aperture\s+)(-?\d+)(\s*)$", raw)
+        if m_ap:
+            old_ap = int(m_ap.group(2))
+            new_ap = aperture_mapping.get(old_ap, old_ap)
+            rewritten.append(f"{m_ap.group(1)}{new_ap}{m_ap.group(3)}{newline}")
+            continue
+
+        rewritten.append(line)
+
+    with open(temp_db_path, "w") as fh:
+        fh.writelines(rewritten)
+
+
+def _cleanup_temporary_reference_artifacts(temp_ref_path, temp_db_candidates):
+    """Best-effort cleanup for per-target temporary reference artifacts."""
+    removed = []
+    failed = []
+    cleanup_paths = [temp_ref_path] + list(dict.fromkeys(temp_db_candidates or []))
+    for path in cleanup_paths:
+        if not path or not os.path.lexists(path):
+            continue
+        try:
+            os.remove(path)
+            removed.append(path)
+        except OSError as exc:
+            failed.append(f"{path} ({exc})")
+    return removed, failed
+
+
+def _prepare_temp_reference_for_target(master_ref_thar, target_star, target_apertures):
+    """Create per-target temporary reference FITS+DB pair and apply remapping."""
+    master_apertures = _read_apertures_from_apnum_cards(master_ref_thar)
+    if not master_apertures:
+        raise RuntimeError(
+            f"Could not read APNUM apertures from master reference ThAr: {master_ref_thar}"
+        )
+
+    aperture_mapping = _build_aperture_mapping(
+        master_apertures,
+        target_apertures,
+        expected_count=4,
+    )
+
+    temp_ref_path = _create_temporary_reference_fits(master_ref_thar, target_star)
+    temp_db_path = None
+    temp_db_candidates = wavelength_db_candidates(temp_ref_path)
+    master_db_path = None
+
+    try:
+        temp_db_path, master_db_path, temp_db_candidates = _clone_temporary_reference_db(
+            master_ref_thar,
+            temp_ref_path,
+        )
+        _renumber_temporary_reference_fits(temp_ref_path, aperture_mapping)
+        _renumber_temporary_reference_db(temp_db_path, temp_ref_path, aperture_mapping)
+    except Exception:
+        _cleanup_temporary_reference_artifacts(temp_ref_path, temp_db_candidates)
+        raise
+
+    return {
+        "target_star": int(target_star),
+        "master_apertures": sorted(master_apertures),
+        "target_apertures": sorted(int(v) for v in target_apertures),
+        "aperture_mapping": aperture_mapping,
+        "temp_ref_path": temp_ref_path,
+        "temp_db_path": temp_db_path,
+        "master_db_path": master_db_path,
+        "cleanup_db_candidates": temp_db_candidates,
+    }
+
+
+def _prepare_temp_target_for_reidentify(master_ref_thar, target_thar, target_star, target_apertures):
+    """Create per-target temporary target FITS and remap target apertures to master apertures."""
+    master_apertures = _read_apertures_from_apnum_cards(master_ref_thar)
+    if not master_apertures:
+        raise RuntimeError(
+            f"Could not read APNUM apertures from master reference ThAr: {master_ref_thar}"
+        )
+
+    target_to_master = _build_aperture_mapping(
+        target_apertures,
+        master_apertures,
+        expected_count=4,
+    )
+    master_to_target = {int(dst): int(src) for src, dst in target_to_master.items()}
+
+    temp_target_path = _create_temporary_target_fits(target_thar, target_star)
+    cleanup_db_candidates = wavelength_db_candidates(temp_target_path)
+
+    try:
+        _renumber_temporary_reference_fits(temp_target_path, target_to_master)
+    except Exception:
+        _cleanup_temporary_reference_artifacts(temp_target_path, cleanup_db_candidates)
+        raise
+
+    return {
+        "target_star": int(target_star),
+        "target_apertures": sorted(int(v) for v in target_apertures),
+        "master_apertures": sorted(int(v) for v in master_apertures),
+        "target_to_master": target_to_master,
+        "master_to_target": master_to_target,
+        "temp_target_path": temp_target_path,
+        "cleanup_db_candidates": cleanup_db_candidates,
+    }
+
+
+def _transfer_reviewed_temp_target_solution_to_real_target(
+    temp_target_path,
+    real_target_thar,
+    master_to_target,
+):
+    """Transfer reviewed temp-target wavelength DB content back to real target identity."""
+    temp_db_path, temp_candidates = resolve_existing_wavelength_db(temp_target_path)
+    if not temp_db_path:
+        raise RuntimeError(
+            "Could not locate temporary target wavelength DB record after review. "
+            f"Checked: {', '.join(temp_candidates)}"
+        )
+
+    real_db_candidates = wavelength_db_candidates(real_target_thar)
+    if not real_db_candidates:
+        raise RuntimeError(f"No DB candidates available for real target: {real_target_thar}")
+
+    real_db_path = real_db_candidates[0]
+    os.makedirs(os.path.dirname(real_db_path) or ".", exist_ok=True)
+    shutil.copy2(temp_db_path, real_db_path)
+
+    # Rewrite to real target identity and restore real target aperture numbering.
+    _renumber_temporary_reference_db(real_db_path, real_target_thar, master_to_target)
+
+    for alias_probe in (
+        real_target_thar,
+        os.path.basename(real_target_thar),
+        stem(real_target_thar),
+        iraf_spec_token(real_target_thar),
+    ):
+        ensure_wavelength_db_aliases(alias_probe, real_db_path)
+
+    return {
+        "temp_db_path": temp_db_path,
+        "real_db_path": real_db_path,
+        "real_db_candidates": real_db_candidates,
+    }
 
 
 def _extract_star_number(path):
@@ -2098,6 +3573,13 @@ def find_step2_outputs(input_dir, night, shoe):
 def main():
     args = parse_args()
 
+    if args.step9_min_found_frac < 0.0 or args.step9_min_found_frac > 1.0:
+        sys.exit("ERROR: --step9-min-found-frac must be within [0, 1].")
+    if args.step9_min_fit_frac < 0.0 or args.step9_min_fit_frac > 1.0:
+        sys.exit("ERROR: --step9-min-fit-frac must be within [0, 1].")
+    if args.step9_max_rms < 0.0:
+        sys.exit("ERROR: --step9-max-rms must be non-negative.")
+
     try:
         selected_steps = selected_steps_from_args(args)
         required_roles = required_roles_for_steps(selected_steps)
@@ -2136,27 +3618,19 @@ def main():
     obj = resolved.get("object")
     twilight = resolved.get("twilight")
     quartz_ref = None
-    if quartz and any(s in selected_steps for s in (1, 5, 6)):
+    if args.quartz_reference:
         try:
-            quartz_ref = prepare_quartz_reference_alias(
-                quartz,
-                meta_by_role,
-                fallback_night=args.night,
-                fallback_shoe=args.shoe,
-            )
-            ensure_quartz_trace_db_alias(quartz, quartz_ref)
+            quartz_ref = args.quartz_reference
+            require_existing(quartz_ref, "--quartz-reference")
+            if quartz and os.path.abspath(quartz) != os.path.abspath(quartz_ref):
+                ensure_quartz_trace_db_alias(quartz, quartz_ref)
         except Exception as exc:
-            sys.exit(f"ERROR preparing quartz reference alias: {exc}")
+            sys.exit(f"ERROR preparing explicit quartz reference: {exc}")
+    elif quartz and any(s in selected_steps for s in (1, 5, 6)):
+        # Default behavior: use quartz directly as the trace reference.
+        quartz_ref = quartz
 
-    step2_expected = {}
-    if quartz:
-        step2_expected["quartz_sl"] = stem(quartz) + "-sl.fits"
-    if thar:
-        step2_expected["thar_sl"] = stem(thar) + "-sl.fits"
-    if obj:
-        step2_expected["obj_sl"] = stem(obj) + "-sl.fits"
-    if twilight:
-        step2_expected["twilight_sl"] = stem(twilight) + "-sl.fits"
+    step2_expected = expected_step2_outputs(quartz, thar, obj, twilight)
 
     print("\n" + "="*72)
     print("  McDonald echelle reduction pipeline")
@@ -2188,6 +3662,18 @@ def main():
     load_packages()
     iraf.echelle.dispaxis = args.dispaxis
 
+    drift_log_path = None
+    if any(s in selected_steps for s in (8, 9)):
+        if args.drift_log:
+            drift_log_path = args.drift_log
+        elif args.night and args.shoe:
+            drift_log_path = f"reidentify_drift_{args.night}_{str(args.shoe).upper()}.csv"
+        else:
+            drift_log_path = "reidentify_drift.csv"
+        if os.path.exists(drift_log_path):
+            os.remove(drift_log_path)
+        print(f"  Reidentify drift log : {drift_log_path}")
+
     state = {}
     obj_outputs = {}
     thar_outputs = {}
@@ -2210,10 +3696,11 @@ def main():
             if 6 in selected_steps:
                 if not quartz_ref:
                     raise RuntimeError(
-                        "Step 6 requires a quartz reference alias. Provide --quartz "
-                        "or run steps 1-4 first."
+                        "Step 6 requires a quartz trace reference. Provide --quartz "
+                        "or --quartz-reference, or run steps 1-4 first."
                     )
-                ensure_quartz_trace_db_alias(quartz, quartz_ref)
+                if quartz and os.path.abspath(quartz) != os.path.abspath(quartz_ref):
+                    ensure_quartz_trace_db_alias(quartz, quartz_ref)
                 require_quartz_trace_db(quartz_ref, "step 6")
         except Exception as exc:
             sys.exit(f"ERROR dependency check: {exc}")
@@ -2243,10 +3730,11 @@ def main():
                 required_step2_keys.add("quartz_sl")
 
             # Step 6 also needs the quartz trace database reference
-            if 6 in selected_steps and not quartz:
+            if 6 in selected_steps and not quartz_ref:
                 raise RuntimeError(
-                    "Step 6 requires the quartz reference file (with trace database). "
-                    "Provide --quartz <quartz_file> or run steps 1-4 first."
+                    "Step 6 requires a quartz reference file with trace database. "
+                    "Provide --quartz <quartz_file> or --quartz-reference <reference_fits>, "
+                    "or run steps 1-4 first."
                 )
 
             # If step2_expected is empty but we need step 2 outputs, scan for them
@@ -2339,30 +3827,50 @@ def main():
         preview_quartz = quartz_ref
         if not preview_quartz:
             sys.exit(
-                "ERROR dependency check: step 5 requires a quartz reference alias image. "
-                "Provide --quartz or run steps 1-4 first."
+                "ERROR dependency check: step 5 requires a quartz reference image. "
+                "Provide --quartz or --quartz-reference, or run steps 1-4 first."
             )
         try:
-            ensure_quartz_trace_db_alias(quartz, preview_quartz)
+            if quartz and os.path.abspath(quartz) != os.path.abspath(preview_quartz):
+                ensure_quartz_trace_db_alias(quartz, preview_quartz)
             require_quartz_trace_db(preview_quartz, "step 5")
         except Exception as exc:
             sys.exit(f"ERROR dependency check: {exc}")
-        _centers, pattern = run_aperture_preview(
-            preview_quartz,
-            n_stars = args.nstars,
-            sep     = args.sep,
-        )
-        state["pattern"] = pattern
+
         map_path = args.affiliation_map or default_affiliation_map_path(
             meta_by_role,
             reference_path=preview_quartz,
             fallback_night=args.night,
             fallback_shoe=args.shoe,
         )
+        geometry_path = default_geometry_path(
+            meta_by_role,
+            reference_path=preview_quartz,
+            fallback_night=args.night,
+            fallback_shoe=args.shoe,
+        )
+        preview_out = os.path.splitext(map_path)[0] + "_preview_map.txt"
+
+        centers, pattern = run_aperture_preview(
+            preview_quartz,
+            n_stars = args.nstars,
+            sep     = args.sep,
+            preview_out=preview_out,
+        )
+        state["pattern"] = pattern
         try:
             save_affiliation_map(map_path, pattern, preview_quartz, meta_by_role)
+            save_step5_geometry(geometry_path, centers, pattern, preview_quartz, meta_by_role)
+            try:
+                plot_step5_geometry_png(geometry_path)
+            except Exception as exc:
+                print(f"  WARNING step-5 geometry PNG failed: {exc}")
         except Exception as exc:
-            sys.exit(f"ERROR saving affiliation map: {exc}")
+            sys.exit(f"ERROR saving step-5 products: {exc}")
+
+        print(f"  Preview mapping saved: {preview_out}")
+        print(f"  Step-5 PNG preview   : {os.path.splitext(preview_out)[0]}_aperture_preview.png")
+        print(f"  Step-5 PNG overlay   : {os.path.splitext(preview_out)[0]}_aperture_overlay.png")
         print(f"\n  Total apertures in accepted mapping: {len(pattern)}")
     elif 6 in selected_steps:
         map_path = args.affiliation_map or default_affiliation_map_path(
@@ -2444,6 +3952,21 @@ def main():
             )
             pair_index = f"extraction_pairs_{night}_{shoe}.csv"
             write_extraction_pairs_index(pair_index, obj_outputs, thar_outputs, state["pattern"])
+
+            star_geometry_path = default_star_geometry_path(
+                meta_by_role,
+                reference_path=quartz_ref or quartz,
+                fallback_night=args.night,
+                fallback_shoe=args.shoe,
+            )
+            save_star_geometry_table(
+                star_geometry_path,
+                state["pattern"],
+                quartz_ref or quartz,
+                obj_outputs,
+                thar_outputs,
+                meta_by_role,
+            )
         except Exception as exc:
             sys.exit(f"ERROR writing extraction pairing index: {exc}")
 
@@ -2527,6 +4050,7 @@ def main():
             coordlist=args.coordlist,
             step8_mode=args.step8_mode,
             step8_reference_thar=args.step8_reference_thar,
+            drift_log_path=drift_log_path,
         )
         state["ref_star"] = ref_star
 
@@ -2542,6 +4066,46 @@ def main():
             )
         # Determine reference star: from step 8 if it ran, otherwise first star
         ref_star = state.get("ref_star", min(crr2_outputs.keys()))
+        step5_geometry_path = None
+        extraction_pairs_path = None
+
+        star_geometry = None
+        try:
+            night_for_step9, shoe_for_step9 = infer_night_shoe(
+                meta_by_role,
+                reference_path=quartz_ref or quartz,
+                fallback_night=args.night,
+                fallback_shoe=args.shoe,
+            )
+            step5_geometry_path = default_geometry_path(
+                meta_by_role,
+                reference_path=quartz_ref or quartz,
+                fallback_night=args.night,
+                fallback_shoe=args.shoe,
+            )
+            candidate_pair_index = f"extraction_pairs_{night_for_step9}_{shoe_for_step9}.csv"
+            if os.path.exists(candidate_pair_index):
+                extraction_pairs_path = candidate_pair_index
+
+            star_geometry_path = default_star_geometry_path(
+                meta_by_role,
+                reference_path=quartz_ref or quartz,
+                fallback_night=args.night,
+                fallback_shoe=args.shoe,
+            )
+            if os.path.exists(star_geometry_path):
+                try:
+                    star_geometry = load_star_geometry_table(star_geometry_path)
+                    print(f"  Loaded star geometry: {star_geometry_path}")
+                except Exception as exc:
+                    print(f"  [warn] Could not load star geometry '{star_geometry_path}': {exc}")
+            else:
+                print(
+                    f"  [warn] Star geometry not found ({star_geometry_path}); "
+                    "falling back to numeric star order."
+                )
+        except Exception as exc:
+            print(f"  [warn] Could not resolve star geometry path: {exc}")
         
         # If step 8 didn't run but we're running step 9, verify ref star has solution
         if 8 not in selected_steps:
@@ -2557,6 +4121,14 @@ def main():
         id_assigned_outputs = auto_wavelength_propagation(
             crr2_outputs, thar_outputs, ref_star,
             coordlist=args.coordlist,
+            drift_log_path=drift_log_path,
+            step9_gate_mode=args.step9_gate_mode,
+            step9_min_found_frac=args.step9_min_found_frac,
+            step9_min_fit_frac=args.step9_min_fit_frac,
+            step9_max_rms=args.step9_max_rms,
+            star_geometry=star_geometry,
+            step5_geometry_path=step5_geometry_path,
+            extraction_pairs_path=extraction_pairs_path,
         )
         state["id_assigned_outputs"] = id_assigned_outputs
 

@@ -39,8 +39,8 @@ Interactive controls (when the figure is focused)
            aperture's star.  A text prompt appears in the terminal.
         f   — after an 'e' edit, press 'f' to recompute affiliations forward
             from that aperture while preserving all manual edits.
-        q   — first press arms quit confirmation; press q again to accept the
-            current mapping and close the window.
+        q/g — first press arms quit confirmation; press q or g again to accept
+            the current mapping and close the window.
     r   — reset all assignments to the auto-generated pattern.
     h   — print a short help reminder to the terminal.
 """
@@ -353,11 +353,11 @@ class TraceViewer:
 
     Panel: aperture-only traces + labels + star-zone bands.
 
-    Supports keys: 'e', 'f', 'q', 'r', 'h'.
+    Supports keys: 'e', 'f', 'q', 'g', 'r', 'h'.
     """
 
     def __init__(self, image_data, centers, pattern, image_name, col, n_stars,
-                 trace_rows=None):
+                 trace_rows=None, save_prefix=None):
         self.data       = image_data
         self.centers    = np.array(centers, dtype=float)
         self.pattern    = np.array(pattern, dtype=int)
@@ -366,6 +366,7 @@ class TraceViewer:
         self.n_stars    = n_stars
         self.n_ap       = len(centers)
         self.trace_rows = trace_rows or {}
+        self.save_prefix = str(save_prefix) if save_prefix is not None else os.path.splitext(image_name)[0]
         self.manual_lock = np.zeros(self.n_ap, dtype=bool)
         self.deleted     = np.zeros(self.n_ap, dtype=bool)  # Track deleted/unused apertures
         self.last_edit_idx = None
@@ -374,6 +375,92 @@ class TraceViewer:
         self._quit_armed = False
 
         self._build_figure()
+
+    # ------------------------------------------------------------------
+    def _save_confirmation_figures(self, dpi=300):
+        """Save confirmation snapshots for later reference.
+
+        Exports two PNG files:
+          1) Current interactive preview pane.
+          2) FITS image with aperture overlays.
+        """
+        preview_png = f"{self.save_prefix}_aperture_preview.png"
+        overlay_png = f"{self.save_prefix}_aperture_overlay.png"
+
+        # 1) Save the currently displayed preview scene.
+        self.fig.savefig(preview_png, dpi=dpi, bbox_inches="tight")
+
+        # 2) Save FITS image with aperture overlays.
+        nrows, ncols = self.data.shape
+        fig, ax = plt.subplots(1, 1, figsize=(16, 9))
+        finite = np.isfinite(self.data)
+        if np.any(finite):
+            vmin, vmax = np.nanpercentile(self.data[finite], [5.0, 99.0])
+            if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
+                vmin, vmax = np.nanmin(self.data), np.nanmax(self.data)
+        else:
+            vmin, vmax = 0.0, 1.0
+
+        ax.imshow(
+            self.data,
+            origin="lower",
+            cmap="gray",
+            aspect="auto",
+            vmin=vmin,
+            vmax=vmax,
+        )
+
+        for i, cen in enumerate(self.centers):
+            is_deleted = self.deleted[i]
+            c = "#cccccc" if is_deleted else star_color(int(self.pattern[i]))
+            lw = 1.0 if is_deleted else 1.4
+            alpha = 0.35 if is_deleted else 0.90
+            ls = "--" if is_deleted else "-"
+
+            if i in self.trace_rows:
+                x_pixels, y_values = self.trace_rows[i]
+                y_trace = np.clip(y_values, 0.0, nrows - 1)
+                ax.plot(x_pixels, y_trace, color=c, lw=lw, alpha=alpha, linestyle=ls)
+                label_x = float(np.clip(x_pixels[0], 0, ncols - 1))
+                label_y = float(np.clip(y_trace[0], 0, nrows - 1))
+            else:
+                ax.plot([0, ncols - 1], [cen, cen], color=c, lw=lw, alpha=alpha, linestyle=ls)
+                label_x = 0.0
+                label_y = float(cen)
+
+            prefix = "(X) " if is_deleted else ""
+            ax.text(
+                label_x,
+                label_y + 1.0,
+                f"{prefix}{i + 1}",
+                color=c,
+                fontsize=6,
+                ha="left",
+                va="bottom",
+                style="italic" if is_deleted else "normal",
+            )
+
+        valid_stars = [s for s in sorted(np.unique(self.pattern)) if s != 0]
+        patches = [
+            mpatches.Patch(color=star_color(s), label=f"Star {s}")
+            for s in valid_stars
+        ]
+        if np.any(self.deleted):
+            patches.append(mpatches.Patch(color="#cccccc", label="Deleted"))
+        if patches:
+            ax.legend(handles=patches, loc="upper right", fontsize=8, framealpha=0.7)
+
+        ax.set_xlim(0, ncols - 1)
+        ax.set_ylim(0, nrows - 1)
+        ax.set_xlabel("X pixel")
+        ax.set_ylabel("Y pixel")
+        ax.set_title(f"Aperture overlays: {self.image_name}")
+        fig.tight_layout()
+        fig.savefig(overlay_png, dpi=dpi, bbox_inches="tight")
+        plt.close(fig)
+
+        print(f"  Saved confirmation figure (300 dpi): {preview_png}")
+        print(f"  Saved FITS+aperture overlay (300 dpi): {overlay_png}")
 
     # ------------------------------------------------------------------
     def _build_figure(self):
@@ -494,10 +581,6 @@ class TraceViewer:
     def _on_key(self, event):
         key = event.key
 
-        if self._quit_armed and key != "q":
-            self._quit_armed = False
-            print("  [q] Quit confirmation canceled.")
-
         # ---- h: help ---------------------------------------------------
         if key == "h":
             print(textwrap.dedent("""
@@ -511,7 +594,7 @@ class TraceViewer:
                 f   Recompute affiliations forward from the last edited aperture.
                     Manual edits and deleted apertures are locked and preserved.
                 r   Reset ALL assignments to the auto-generated pattern.
-                q   Press twice to accept the current mapping and continue.
+                q/g Accept current mapping, save PNGs, and continue.
                 h   Print this help text.
             """))
             return
@@ -522,7 +605,6 @@ class TraceViewer:
             self.manual_lock[:] = False
             self.deleted[:]     = False
             self.last_edit_idx = None
-            self._quit_armed = False
             self._refresh_colors()
             print("  [reset] All assignments restored to auto-generated pattern.")
             return
@@ -587,15 +669,13 @@ class TraceViewer:
             )
             return
 
-        # ---- q: double-press quit confirmation -------------------------
-        if key == "q":
-            if not self._quit_armed:
-                self._quit_armed = True
-                print("\n  [q] Press q again to confirm and continue. Any other key cancels.")
-                return
-
-            print("\n  [q] Mapping accepted.  Closing preview window.")
-            self._quit_armed = False
+        # ---- q/g: accept mapping and finish -----------------------------
+        if key in ("q", "g"):
+            print("\n  [q/g] Mapping accepted.  Closing preview window.")
+            try:
+                self._save_confirmation_figures(dpi=300)
+            except Exception as exc:
+                print(f"  [warn] Could not save confirmation figures: {exc}")
             self.done = True
             plt.close(self.fig)
             return
@@ -617,12 +697,12 @@ def parse_args():
     p.add_argument("image", help="Stacked science FITS image (mosaic).")
     p.add_argument("--nap",    type=int,   default=None,
                    help="Number of apertures (default: auto-detect).")
-    p.add_argument("--sep",    type=float, default=5.0,
-                   help="Expected separation between apertures in px (default: 5).")
+    p.add_argument("--sep",    type=float, default=8.0,
+                   help="Expected separation between apertures in px (default: 8).")
     p.add_argument("--col",    type=int,   default=None,
                    help="Dispersion column for the spatial cut (default: image centre).")
-    p.add_argument("--nstars", type=int,   default=4,
-                   help="Number of unique stars in the repeating pattern (default: 4).")
+    p.add_argument("--nstars", type=int, default=24,
+                   help="Number of unique stars in the repeating pattern (default: 24).")
     p.add_argument("--out",    type=str,   default=None,
                    help="Output file for the final aperture→star mapping.")
     return p.parse_args()
@@ -702,6 +782,9 @@ def main():
 
     # ── interactive viewer ──────────────────────────────────────────────────
     image_name = os.path.basename(args.image)
+    outpath = args.out or f"{os.path.splitext(image_name)[0]}_star_map.txt"
+    save_prefix = str(Path(outpath).with_suffix(""))
+
     viewer     = TraceViewer(
         data,
         centers,
@@ -710,11 +793,18 @@ def main():
         col,
         args.nstars,
         trace_rows=trace_rows,
+        save_prefix=save_prefix,
     )
 
     print("\n  Opening interactive preview window …")
     print("  Press [h] inside the window for a control summary.\n")
     viewer.show()
+
+    if not viewer.done:
+        raise RuntimeError(
+            "Preview closed without confirmation. Press 'q' twice to accept the mapping "
+            "and trigger PNG exports."
+        )
 
     # After window closes
     final_pattern = viewer.pattern.copy()
@@ -728,8 +818,6 @@ def main():
         print(f"  ap {i+1:>4}  row {cen:>7.1f}  star {star}")
 
     # ── save mapping ─────────────────────────────────────────────────────────
-    base   = os.path.splitext(image_name)[0]
-    outpath = args.out or f"{base}_star_map.txt"
     save_mapping(outpath, image_name, final_centers, final_pattern)
 
     return final_centers, final_pattern
@@ -782,6 +870,9 @@ def run_preview(image_path, nap=None, sep=5.0, col=None, n_stars=4, out=None):
 
     pattern = default_pattern(len(centers), n_stars=n_stars)
     image_name = os.path.basename(image_path)
+    outpath = out or f"{os.path.splitext(image_name)[0]}_star_map.txt"
+    save_prefix = str(Path(outpath).with_suffix(""))
+
     viewer = TraceViewer(
         data,
         centers,
@@ -790,14 +881,19 @@ def run_preview(image_path, nap=None, sep=5.0, col=None, n_stars=4, out=None):
         _col,
         n_stars,
         trace_rows=trace_rows,
+        save_prefix=save_prefix,
     )
 
     print(f"\n  Opening interactive preview for {image_name} …")
     print("  Press [h] inside the window for controls.\n")
     viewer.show()
 
-    base         = os.path.splitext(image_name)[0]
-    outpath      = out or f"{base}_star_map.txt"
+    if not viewer.done:
+        raise RuntimeError(
+            "Preview closed without confirmation. Press 'q' twice to accept the mapping "
+            "and trigger PNG exports."
+        )
+
     final_pattern = viewer.pattern.copy()
     # Mark deleted apertures as 0 so they are skipped during extraction
     final_pattern[viewer.deleted] = 0
