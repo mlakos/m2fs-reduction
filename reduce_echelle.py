@@ -109,10 +109,25 @@ def stem(path):
     return os.path.splitext(os.path.basename(path))[0]
 
 
+def canonical_wavelength_identity(path_or_token):
+    """Return canonical IRAF wavelength identity token (bare root, no .fits)."""
+    text = str(path_or_token or "").strip().strip("\"'")
+    if not text:
+        return ""
+
+    # Strip IRAF section/selection syntax, then canonicalize to basename root.
+    text = text.split("[", 1)[0].strip()
+    text = os.path.basename(text)
+    if text.startswith("./"):
+        text = text[2:]
+    if text.lower().endswith(".fits"):
+        text = text[:-5]
+    return text
+
+
 def iraf_spec_token(path):
-    """Return canonical IRAF spectroscopy/database image token (./<root>)."""
-    # Filesystem names stay as *.fits; IRAF spectroscopy tasks use ./<root>.
-    return stem(path)
+    """Return canonical IRAF spectroscopy/database image token (bare root)."""
+    return canonical_wavelength_identity(path)
 
 
 def write_list(listpath, items):
@@ -1187,21 +1202,20 @@ def _ecreidentify_thar(thar_ec, ref_thar_ec, drift_log_path=None, drift_stage="s
         If True, retry once with shift=INDEF when hinted call fails.
     """
     reference_input = reference_override if reference_override else ref_thar_ec
-    # ecreidentify expects image names as they appear in DB begin records,
-    # which for this pipeline are FITS basenames (not stem-only tokens).
-    iraf_target_token = os.path.basename(thar_ec)
-    iraf_reference_token = os.path.basename(reference_input)
+    iraf_target_token = iraf_spec_token(thar_ec)
+    iraf_reference_token = iraf_spec_token(reference_input)
 
     found_db = None
-    for probe in (reference_input, os.path.basename(reference_input), stem(reference_input), iraf_reference_token):
+    for probe in (reference_input, iraf_reference_token):
         found_db, _db_candidates = resolve_existing_wavelength_db(probe)
         if found_db:
             break
 
     if found_db:
-        # Keep DB lookup permissive, but normalize actual IRAF task identity.
-        for alias_probe in (reference_input, os.path.basename(reference_input), stem(reference_input), iraf_reference_token):
-            ensure_wavelength_db_aliases(alias_probe, found_db)
+        found_db = ensure_canonical_wavelength_db_entry(
+            iraf_reference_token,
+            source_db=found_db,
+        )
 
     shift_value = "INDEF" if predicted_shift is None else float(predicted_shift)
     cradius_value = 8.0 if search_radius is None else float(search_radius)
@@ -1415,18 +1429,82 @@ def evaluate_reidentify_quality(metrics, min_found_frac, min_fit_frac, max_rms):
 
 
 def ensure_wavelength_db_aliases(thar_path, source_db):
-    """Populate expected DB alias names for a resolved reference ThAr solution."""
-    if not source_db or not os.path.exists(source_db):
-        return
+    """Backward-compatible wrapper: canonicalize wavelength DB entry only."""
+    return ensure_canonical_wavelength_db_entry(thar_path, source_db=source_db)
 
-    src_abs = os.path.abspath(source_db)
-    for candidate in wavelength_db_candidates(thar_path):
-        if os.path.exists(candidate):
+
+def normalize_ec_database_records(db_path, canonical_root, aperture_mapping=None):
+    """Normalize wavelength DB record identity fields to canonical bare-root token."""
+    if not db_path or not os.path.exists(db_path):
+        return False
+
+    canonical_token = canonical_wavelength_identity(canonical_root)
+    if not canonical_token:
+        return False
+
+    with open(db_path, "r") as fh:
+        lines = fh.readlines()
+
+    rewritten = []
+    changed = False
+    for line in lines:
+        raw = line.rstrip("\n")
+        newline = "\n" if line.endswith("\n") else ""
+        stripped = raw.strip()
+
+        m_begin_ap = re.match(r"^(\s*begin\s+\S+\s+)(\S+)(\s+)(-?\d+)(\s*)$", raw)
+        if m_begin_ap:
+            old_ap = int(m_begin_ap.group(4))
+            new_ap = aperture_mapping.get(old_ap, old_ap) if aperture_mapping else old_ap
+            new_line = (
+                f"{m_begin_ap.group(1)}{canonical_token}{m_begin_ap.group(3)}"
+                f"{new_ap}{m_begin_ap.group(5)}{newline}"
+            )
+            rewritten.append(new_line)
+            if new_line != line:
+                changed = True
             continue
-        try:
-            os.symlink(src_abs, candidate)
-        except OSError:
-            shutil.copy2(source_db, candidate)
+
+        m_begin = re.match(r"^(\s*begin\s+\S+\s+)(\S+)(\s*)$", raw)
+        if m_begin:
+            new_line = f"{m_begin.group(1)}{canonical_token}{m_begin.group(3)}{newline}"
+            rewritten.append(new_line)
+            if new_line != line:
+                changed = True
+            continue
+
+        m_image = re.match(r"^(\s*image\s+)(\S+)(\s*)$", raw)
+        if m_image:
+            new_line = f"{m_image.group(1)}{canonical_token}{m_image.group(3)}{newline}"
+            rewritten.append(new_line)
+            if new_line != line:
+                changed = True
+            continue
+
+        m_id = re.match(r"^(\s*id\s+)(\S+)(\s*)$", raw)
+        if m_id:
+            new_line = f"{m_id.group(1)}{canonical_token}{m_id.group(3)}{newline}"
+            rewritten.append(new_line)
+            if new_line != line:
+                changed = True
+            continue
+
+        m_ap = re.match(r"^(\s*aperture\s+)(-?\d+)(\s*)$", raw)
+        if m_ap and aperture_mapping:
+            old_ap = int(m_ap.group(2))
+            new_ap = aperture_mapping.get(old_ap, old_ap)
+            new_line = f"{m_ap.group(1)}{new_ap}{m_ap.group(3)}{newline}"
+            rewritten.append(new_line)
+            if new_line != line:
+                changed = True
+            continue
+
+        rewritten.append(line)
+
+    if changed:
+        with open(db_path, "w") as fh:
+            fh.writelines(rewritten)
+    return changed
 
 
 def _review_reidentified_lines(thar_ec, coordlist):
@@ -1599,12 +1677,16 @@ def _resolve_reuse_reference_thar(reference_thar):
             f"for reference ThAr '{ref_path}'. Checked: {', '.join(db_candidates)}"
         )
 
-    ensure_wavelength_db_aliases(ref_path, found_db)
-    ref_token = os.path.basename(ref_path)
-    ensure_wavelength_db_aliases(ref_token, found_db)
+    ref_token = iraf_spec_token(ref_path)
+    canonical_db = ensure_canonical_wavelength_db_entry(ref_token, source_db=found_db)
+    if not canonical_db:
+        raise RuntimeError(
+            "Step 8 reuse mode could not normalize the wavelength DB to canonical form "
+            f"for reference token '{ref_token}'."
+        )
 
     print(f"  reuse reference ThAr : {ref_token}")
-    print(f"  reuse wavelength DB  : {found_db}")
+    print(f"  reuse wavelength DB  : {canonical_db}")
     return ref_token
 
 
@@ -1711,12 +1793,16 @@ def auto_wavelength_propagation(crr2_outputs, thar_outputs, ref_star,
     failed_gate_stars = []
 
     if step9_gate_mode != "off":
+        gate_action = "warn-only (continue review/transfer-back)"
+        if step9_gate_mode == "strict":
+            gate_action = "strict (skip review/transfer-back on failure)"
         print(
             "  Step 9 gate: "
             f"mode={step9_gate_mode}, "
             f"min_found_frac={step9_min_found_frac:.3f}, "
             f"min_fit_frac={step9_min_fit_frac:.3f}, "
-            f"max_rms={step9_max_rms:.3f}"
+            f"max_rms={step9_max_rms:.3f}, "
+            f"action={gate_action}"
         )
 
     star_order = star_order_by_distance_from_reference(
@@ -1788,9 +1874,12 @@ def auto_wavelength_propagation(crr2_outputs, thar_outputs, ref_star,
                     else:
                         failure_text = "; ".join(failures)
                         print(f"     gate: FAIL ({failure_text})")
-                        print("     gate action: skipping review/transfer-back for this star")
-                        failed_gate_stars.append(star)
-                        gate_failed = True
+                        if step9_gate_mode == "strict":
+                            print("     gate action: strict -> skipping review/transfer-back for this star")
+                            failed_gate_stars.append(star)
+                            gate_failed = True
+                        else:
+                            print("     gate action: warn -> continuing to review/transfer-back")
 
                 if not gate_failed:
                     print("     review start     : ecidentify on temporary target")
@@ -1868,22 +1957,75 @@ def apply_refspec_to_objects(crr2_outputs, thar_outputs, skip_stars=None):
             print(f"     checked DB paths : {', '.join(db_candidates)}")
             continue
 
-        ensure_wavelength_db_aliases(thar_ec, found_db)
-        print(f"     wavelength DB    : {found_db}")
+        canonical_thar = iraf_spec_token(thar_ec)
+        canonical_db = ensure_canonical_wavelength_db_entry(canonical_thar, source_db=found_db)
+        if not canonical_db:
+            print("     skip reason      : could not normalize reviewed ThAr DB to canonical form")
+            continue
+
+        print(f"     wavelength token : {canonical_thar}")
+        print(f"     wavelength DB    : {canonical_db}")
         print("     refspec start    : real object <- real target")
-        _refspec_one(obj_crr2, thar_ec)
-        print("     refspec end      : assignment complete")
+        _refspec_one(obj_crr2, canonical_thar)
+        print("     refspec end      : assignment complete; verifying object header")
+
+        has_refspec, token_or_reason = object_has_refspec_assignment(obj_crr2, normalize=True)
+        if not has_refspec:
+            print(f"     skip reason      : {token_or_reason}")
+            continue
+
+        print(f"     normalized token : {token_or_reason}")
         refspec_outputs[star] = obj_crr2
 
     return refspec_outputs
 
 
-def object_has_refspec_assignment(obj_ec):
+def _canonical_refspec_value(value):
+    """Extract canonical bare-root REFSPEC token from a FITS header value."""
+    text = str(value or "").strip()
+    if not text or text.upper() in {"INDEF", "NONE"}:
+        return ""
+
+    token = re.split(r"[\s,]+", text, maxsplit=1)[0]
+    return canonical_wavelength_identity(token)
+
+
+def object_has_refspec_assignment(obj_ec, normalize=False):
     """Return (ok, token_or_reason) for object-side refspec assignment readiness."""
     try:
-        hdr = fits.getheader(obj_ec)
+        if normalize:
+            with fits.open(obj_ec, mode="update") as hdul:
+                hdr = hdul[0].header
+                refspec_keys = [
+                    k for k in hdr.keys()
+                    if str(k) == "REFSPEC" or re.match(r"^REFSPEC\d+$", str(k))
+                ]
+                if not refspec_keys:
+                    return False, "missing REFSPEC assignment in object header"
+
+                found_token = ""
+                changed = False
+                for key in sorted(refspec_keys):
+                    raw = str(hdr.get(key, "")).strip()
+                    token = _canonical_refspec_value(raw)
+                    if token and raw != token:
+                        hdr[key] = token
+                        changed = True
+                    if token and not found_token:
+                        found_token = token
+
+                if changed:
+                    hdul.flush()
+
+                if found_token:
+                    return True, found_token
+        else:
+            hdr = fits.getheader(obj_ec)
     except Exception as exc:
         return False, f"could not read FITS header ({exc})"
+
+    if normalize:
+        return False, "REFSPEC assignment is empty/undefined after normalization"
 
     refspec_keys = [
         k for k in hdr.keys()
@@ -1893,8 +2035,8 @@ def object_has_refspec_assignment(obj_ec):
         return False, "missing REFSPEC assignment in object header"
 
     for key in sorted(refspec_keys):
-        token = str(hdr.get(key, "")).strip()
-        if token and token.upper() not in {"INDEF", "NONE"}:
+        token = _canonical_refspec_value(hdr.get(key, ""))
+        if token:
             return True, token
 
     return False, "REFSPEC assignment is empty/undefined in object header"
@@ -1902,7 +2044,7 @@ def object_has_refspec_assignment(obj_ec):
 
 def thar_db_has_dispersion_function(thar_ref_token_or_path, resolved_db_path=None):
     """Return (ok, details) for usable echelle dispersion function in ThAr DB."""
-    ref_token = str(thar_ref_token_or_path).strip()
+    ref_token = canonical_wavelength_identity(thar_ref_token_or_path)
     if not ref_token:
         return False, "empty ThAr reference token"
 
@@ -1916,6 +2058,10 @@ def thar_db_has_dispersion_function(thar_ref_token_or_path, resolved_db_path=Non
             f"(checked: {', '.join(db_candidates)})"
         )
 
+    db_path = ensure_canonical_wavelength_db_entry(ref_token, source_db=db_path)
+    if not db_path:
+        return False, f"could not resolve canonical wavelength DB for REFSPEC token '{ref_token}'"
+
     try:
         with open(db_path, "r") as fh:
             lines = fh.readlines()
@@ -1924,28 +2070,26 @@ def thar_db_has_dispersion_function(thar_ref_token_or_path, resolved_db_path=Non
 
     exact_found = False
     exact_with_coeff = False
-    variant_with_coeff = []
+    matching_records = set()
     current_image = None
+    current_image_raw = None
     current_coeff = None
 
-    def _flush_record(image_token, coeff_count):
-        nonlocal exact_found, exact_with_coeff, variant_with_coeff
+    def _flush_record(image_token, image_raw, coeff_count):
+        nonlocal exact_found, exact_with_coeff, matching_records
         if image_token is None:
             return
-        image_text = str(image_token).strip()
+        image_text = canonical_wavelength_identity(image_token)
         if not image_text:
             return
         has_coeff = coeff_count is not None and coeff_count > 0
         if image_text == ref_token:
             exact_found = True
+            if image_raw:
+                matching_records.add(str(image_raw).strip())
             if has_coeff:
                 exact_with_coeff = True
             return
-
-        # Keep variant tracking to explain mismatch cases clearly.
-        if has_coeff:
-            if stem(image_text) == stem(ref_token):
-                variant_with_coeff.append(image_text)
 
     for raw in lines:
         line = raw.strip()
@@ -1955,9 +2099,10 @@ def thar_db_has_dispersion_function(thar_ref_token_or_path, resolved_db_path=Non
             continue
 
         if line.startswith("begin"):
-            _flush_record(current_image, current_coeff)
+            _flush_record(current_image, current_image_raw, current_coeff)
             parts = line.split()
-            current_image = parts[2] if len(parts) >= 3 else None
+            current_image_raw = parts[2] if len(parts) >= 3 else None
+            current_image = canonical_wavelength_identity(current_image_raw)
             current_coeff = None
             continue
 
@@ -1972,21 +2117,16 @@ def thar_db_has_dispersion_function(thar_ref_token_or_path, resolved_db_path=Non
                 except ValueError:
                     current_coeff = 0
 
-    _flush_record(current_image, current_coeff)
+    _flush_record(current_image, current_image_raw, current_coeff)
 
     if exact_with_coeff:
         return True, db_path
 
     if exact_found:
+        record_text = ", ".join(sorted(matching_records)) if matching_records else ref_token
         return False, (
-            f"DB exists ({db_path}) but REFSPEC record '{ref_token}' lacks usable coefficients"
-        )
-
-    if variant_with_coeff:
-        variant_text = ", ".join(sorted(set(variant_with_coeff)))
-        return False, (
-            f"DB exists ({db_path}) but no coefficient record matches REFSPEC token '{ref_token}' "
-            f"(found only variant record(s): {variant_text})"
+            f"DB exists ({db_path}) but matching REFSPEC record(s) '{record_text}' "
+            "lack usable coefficients"
         )
 
     return False, (
@@ -1994,7 +2134,7 @@ def thar_db_has_dispersion_function(thar_ref_token_or_path, resolved_db_path=Non
     )
 
 
-def infer_step10_ready_outputs(crr2_outputs, thar_outputs):
+def infer_step10_ready_outputs(crr2_outputs):
     """Infer stars eligible for step 11 from object-side refspec readiness."""
     refspec_outputs = {}
     skip_reasons = {}
@@ -2002,7 +2142,7 @@ def infer_step10_ready_outputs(crr2_outputs, thar_outputs):
 
     for star in sorted(crr2_outputs):
         obj_crr2 = crr2_outputs[star]
-        has_refspec, token_or_reason = object_has_refspec_assignment(obj_crr2)
+        has_refspec, token_or_reason = object_has_refspec_assignment(obj_crr2, normalize=True)
         if not has_refspec:
             skip_reasons[star] = token_or_reason
             continue
@@ -2017,22 +2157,22 @@ def infer_step10_ready_outputs(crr2_outputs, thar_outputs):
             )
             continue
 
-        ensure_wavelength_db_aliases(ref_token, found_db)
+        canonical_db = ensure_canonical_wavelength_db_entry(ref_token, source_db=found_db)
+        if not canonical_db:
+            skip_reasons[star] = (
+                "object has REFSPEC assignment but canonical DB normalization failed"
+            )
+            continue
+
         has_disp, disp_details = thar_db_has_dispersion_function(
             ref_token,
-            resolved_db_path=found_db,
+            resolved_db_path=canonical_db,
         )
         if not has_disp:
             skip_reasons[star] = (
                 "object has REFSPEC assignment but DB dispersion validation failed "
                 f"({disp_details})"
             )
-            continue
-
-        # Optional cross-check only; this is not the readiness criterion.
-        thar_ec = thar_outputs.get(star)
-        if thar_ec is None:
-            skip_reasons[star] = "missing ThAr extraction for this star"
             continue
 
         refspec_outputs[star] = obj_crr2
@@ -2073,7 +2213,7 @@ def apply_dispcor_to_objects(refspec_outputs, crr2_outputs=None, skip_reasons=No
         source = readiness_sources.get(star, "same-session Step 10 output")
         print(f"     readiness source : {source}")
 
-        has_refspec, token_or_reason = object_has_refspec_assignment(input_obj)
+        has_refspec, token_or_reason = object_has_refspec_assignment(input_obj, normalize=True)
         if not has_refspec:
             print(f"     skip reason      : {token_or_reason}")
             continue
@@ -2091,10 +2231,16 @@ def apply_dispcor_to_objects(refspec_outputs, crr2_outputs=None, skip_reasons=No
             print(f"     checked DB paths : {', '.join(db_candidates)}")
             continue
 
-        print(f"     resolved DB path : {found_db}")
+        canonical_db = ensure_canonical_wavelength_db_entry(ref_token, source_db=found_db)
+        if not canonical_db:
+            print("     dispersion check : FAIL")
+            print("     skip reason      : could not normalize referenced ThAr DB to canonical form")
+            continue
+
+        print(f"     resolved DB path : {canonical_db}")
         has_disp, disp_details = thar_db_has_dispersion_function(
             ref_token,
-            resolved_db_path=found_db,
+            resolved_db_path=canonical_db,
         )
         if not has_disp:
             print("     dispersion check : FAIL")
@@ -2521,22 +2667,37 @@ def ensure_quartz_trace_db_alias(source_quartz, alias_quartz):
     return None
 
 
-def wavelength_db_candidates(thar_path):
-    """Return likely IRAF wavelength-database paths for a ThAr spectrum."""
+def canonical_wavelength_db_path(thar_path, db_dir="./database"):
+    """Return canonical wavelength DB path for a ThAr identity token/path."""
+    root = canonical_wavelength_identity(thar_path)
+    if not root:
+        return None
+    return os.path.join(db_dir, f"ec{root}")
+
+
+def wavelength_db_candidates(thar_path, include_legacy=True):
+    """Return candidate wavelength DB paths (canonical first, legacy read-only after)."""
     db_dir = "./database"
-    base_stem = stem(thar_path)
-    base_name = os.path.basename(thar_path)
-    candidates = [
-        f"{db_dir}/ec{base_stem}",
-        f"{db_dir}/ec.{base_stem}",
-        f"{db_dir}/ec_{base_stem}",
-        f"{db_dir}/ec{base_name}",
-        f"{db_dir}/ec.{base_name}",
-        f"{db_dir}/ec_{base_name}",
-        # Compatibility: some historical runs produce ec.ec* style names.
-        f"{db_dir}/ec.ec{base_stem}",
-        f"{db_dir}/ec.ec{base_name}",
-    ]
+    canonical = canonical_wavelength_db_path(thar_path, db_dir=db_dir)
+    candidates = [canonical] if canonical else []
+
+    if include_legacy:
+        tokens = [
+            canonical_wavelength_identity(thar_path),
+            stem(str(thar_path or "")),
+            os.path.basename(str(thar_path or "")),
+        ]
+        for token in tokens:
+            if not token:
+                continue
+            candidates.extend(
+                [
+                    f"{db_dir}/ec.{token}",
+                    f"{db_dir}/ec_{token}",
+                    f"{db_dir}/ec.ec{token}",
+                    f"{db_dir}/ec{token}.fits",
+                ]
+            )
 
     unique = []
     seen = set()
@@ -2548,13 +2709,45 @@ def wavelength_db_candidates(thar_path):
     return unique
 
 
-def resolve_existing_wavelength_db(thar_path):
+def resolve_existing_wavelength_db(thar_path, include_legacy=True):
     """Return the first existing wavelength DB path and full candidate list."""
-    candidates = wavelength_db_candidates(thar_path)
+    candidates = wavelength_db_candidates(thar_path, include_legacy=include_legacy)
     for candidate in candidates:
         if os.path.exists(candidate):
             return candidate, candidates
     return None, candidates
+
+
+def ensure_canonical_wavelength_db_entry(thar_path_or_token, source_db=None):
+    """Ensure canonical DB path exists and has canonicalized record identity fields."""
+    canonical_db = canonical_wavelength_db_path(thar_path_or_token)
+    canonical_root = canonical_wavelength_identity(thar_path_or_token)
+    if not canonical_db or not canonical_root:
+        return None
+
+    chosen_source = source_db
+    if not chosen_source or not os.path.exists(chosen_source):
+        chosen_source, _ = resolve_existing_wavelength_db(thar_path_or_token, include_legacy=True)
+
+    os.makedirs(os.path.dirname(canonical_db) or ".", exist_ok=True)
+
+    if chosen_source and os.path.exists(chosen_source):
+        same_path = os.path.abspath(chosen_source) == os.path.abspath(canonical_db)
+        if not same_path:
+            needs_copy = not os.path.exists(canonical_db)
+            if not needs_copy:
+                try:
+                    needs_copy = os.path.getmtime(chosen_source) > os.path.getmtime(canonical_db)
+                except OSError:
+                    needs_copy = True
+            if needs_copy:
+                shutil.copy2(chosen_source, canonical_db)
+
+    if not os.path.exists(canonical_db):
+        return None
+
+    normalize_ec_database_records(canonical_db, canonical_root)
+    return canonical_db
 
 
 def quartz_trace_db_candidates(quartz):
@@ -3438,13 +3631,14 @@ def _resolve_master_reference_db(master_ref_thar):
 def _clone_temporary_reference_db(master_ref_thar, temp_ref_path):
     """Clone master wavelength DB record to temp reference DB entry."""
     master_db = _resolve_master_reference_db(master_ref_thar)
-    temp_candidates = wavelength_db_candidates(temp_ref_path)
+    temp_candidates = wavelength_db_candidates(temp_ref_path, include_legacy=False)
     if not temp_candidates:
         raise RuntimeError(f"No DB candidates available for temporary reference: {temp_ref_path}")
 
     temp_db = temp_candidates[0]
     os.makedirs(os.path.dirname(temp_db) or ".", exist_ok=True)
     shutil.copy2(master_db, temp_db)
+    normalize_ec_database_records(temp_db, iraf_spec_token(temp_ref_path))
     return temp_db, master_db, temp_candidates
 
 
@@ -3501,47 +3695,11 @@ def _renumber_temporary_reference_fits(temp_ref_path, aperture_mapping):
 def _renumber_temporary_reference_db(temp_db_path, temp_ref_path, aperture_mapping):
     """Apply identical aperture remapping to temporary wavelength DB record."""
     tmp_image_token = iraf_spec_token(temp_ref_path)
-    with open(temp_db_path, "r") as fh:
-        lines = fh.readlines()
-
-    rewritten = []
-    for line in lines:
-        raw = line.rstrip("\n")
-        newline = "\n" if line.endswith("\n") else ""
-        stripped = raw.strip()
-
-        if stripped.startswith("image"):
-            indent = raw[:len(raw) - len(raw.lstrip())]
-            rewritten.append(f"{indent}image\t{tmp_image_token}{newline}")
-            continue
-
-        m_begin_ap = re.match(r"^(\s*begin\s+\S+\s+)(\S+)(\s+)(-?\d+)(\s*)$", raw)
-        if m_begin_ap:
-            old_ap = int(m_begin_ap.group(4))
-            new_ap = aperture_mapping.get(old_ap, old_ap)
-            rewritten.append(
-                f"{m_begin_ap.group(1)}{tmp_image_token}{m_begin_ap.group(3)}{new_ap}{m_begin_ap.group(5)}{newline}"
-            )
-            continue
-
-        m_begin = re.match(r"^(\s*begin\s+\S+\s+)(\S+)(\s*)$", raw)
-        if m_begin:
-            rewritten.append(
-                f"{m_begin.group(1)}{tmp_image_token}{m_begin.group(3)}{newline}"
-            )
-            continue
-
-        m_ap = re.match(r"^(\s*aperture\s+)(-?\d+)(\s*)$", raw)
-        if m_ap:
-            old_ap = int(m_ap.group(2))
-            new_ap = aperture_mapping.get(old_ap, old_ap)
-            rewritten.append(f"{m_ap.group(1)}{new_ap}{m_ap.group(3)}{newline}")
-            continue
-
-        rewritten.append(line)
-
-    with open(temp_db_path, "w") as fh:
-        fh.writelines(rewritten)
+    normalize_ec_database_records(
+        temp_db_path,
+        tmp_image_token,
+        aperture_mapping=aperture_mapping,
+    )
 
 
 def _cleanup_temporary_reference_artifacts(temp_ref_path, temp_db_candidates):
@@ -3576,7 +3734,7 @@ def _prepare_temp_reference_for_target(master_ref_thar, target_star, target_aper
 
     temp_ref_path = _create_temporary_reference_fits(master_ref_thar, target_star)
     temp_db_path = None
-    temp_db_candidates = wavelength_db_candidates(temp_ref_path)
+    temp_db_candidates = wavelength_db_candidates(temp_ref_path, include_legacy=False)
     master_db_path = None
 
     try:
@@ -3620,7 +3778,7 @@ def _prepare_temp_target_for_reidentify(master_ref_thar, target_thar, target_sta
     temp_target_path = _create_temporary_target_fits(target_thar, target_star)
     temp_db_path = None
     master_db_path = None
-    cleanup_db_candidates = wavelength_db_candidates(temp_target_path)
+    cleanup_db_candidates = wavelength_db_candidates(temp_target_path, include_legacy=False)
 
     try:
         _renumber_temporary_reference_fits(temp_target_path, target_to_master)
@@ -3630,13 +3788,6 @@ def _prepare_temp_target_for_reidentify(master_ref_thar, target_thar, target_sta
             temp_target_path,
         )
         _renumber_temporary_reference_db(temp_db_path, temp_target_path, target_to_master)
-        for alias_probe in (
-            temp_target_path,
-            os.path.basename(temp_target_path),
-            stem(temp_target_path),
-            iraf_spec_token(temp_target_path),
-        ):
-            ensure_wavelength_db_aliases(alias_probe, temp_db_path)
     except Exception:
         _cleanup_temporary_reference_artifacts(temp_target_path, cleanup_db_candidates)
         raise
@@ -3667,7 +3818,7 @@ def _transfer_reviewed_temp_target_solution_to_real_target(
             f"Checked: {', '.join(temp_candidates)}"
         )
 
-    real_db_candidates = wavelength_db_candidates(real_target_thar)
+    real_db_candidates = wavelength_db_candidates(real_target_thar, include_legacy=False)
     if not real_db_candidates:
         raise RuntimeError(f"No DB candidates available for real target: {real_target_thar}")
 
@@ -3677,14 +3828,6 @@ def _transfer_reviewed_temp_target_solution_to_real_target(
 
     # Rewrite to real target identity and restore real target aperture numbering.
     _renumber_temporary_reference_db(real_db_path, real_target_thar, master_to_target)
-
-    for alias_probe in (
-        real_target_thar,
-        os.path.basename(real_target_thar),
-        stem(real_target_thar),
-        iraf_spec_token(real_target_thar),
-    ):
-        ensure_wavelength_db_aliases(alias_probe, real_db_path)
 
     return {
         "temp_db_path": temp_db_path,
@@ -4502,14 +4645,8 @@ def main():
                 for star in refspec_outputs
             }
         else:
-            if not thar_outputs:
-                sys.exit(
-                    "ERROR dependency check: step 11 requires ThAr extractions to validate "
-                    "existing step-10-ready stars. Run step 6 first or include it in the step range."
-                )
             refspec_outputs, step11_skip_reasons, step11_readiness_sources = infer_step10_ready_outputs(
                 crr2_outputs,
-                thar_outputs,
             )
             state["refspec_outputs"] = refspec_outputs
             print(
