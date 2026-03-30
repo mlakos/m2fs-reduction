@@ -39,14 +39,19 @@ Pipeline steps
       a. choose mode for first (reference) star:
         - manual: ecidentify (interactive) on that star's ThAr
         - reuse : ecreidentify from an already identified ThAr reference
-      b. refspec     assign the solution to that star's CR-cleaned object
-      – The solution is saved/used in the IRAF database for step 9
-  9.  Automatic line-ID propagation + review  (ecreidentify to remaining stars)
+    – The solution is saved/used in the IRAF database for steps 9-11
+  9.  Automatic line-ID propagation + required review  (ecreidentify to remaining stars)
       a. ecreidentify (automatic)   propagates line IDs from ref star to others
       b. review      inspect reidentified ThAr line IDs (interactive when TTY)
-      c. refspec     assign the reviewed IDs to each object spectrum
-      – outputs: no new FITS files in this section (refspec updates assignments)
-      – workflow: run step 8 (interactive), then step 9 (automatic + review)
+      c. transfer reviewed temp-target solution back to real target ThAr DB identity
+      – outputs: no new FITS files in this section
+  10. refspec assignment to CR-cleaned object spectra
+      – runs on *_ec-crr2.fits using reviewed real-target ThAr identities
+      – skips stars without a valid identified/reviewed ThAr solution
+      – workflow: run step 8 (interactive), then step 9 (automatic + review), then step 10
+  11. dispcor wavelength linearization of refspec-assigned object spectra
+      – runs only for stars that successfully passed step 10
+      – outputs: *_ec-crr2-dc.fits
 
 # NOTE: "ENOISE" and "EGAIN" keyowrds should always be used in iraf values for readnoise and gain
 
@@ -1101,7 +1106,7 @@ def expected_step7_outputs(obj_outputs):
 
 
 # ---------------------------------------------------------------------------
-# Step 8/9 – line identification propagation (ecidentify/ecreidentify + refspec)
+# Step 8/9/10/11 – line identification and wavelength assignment
 # ---------------------------------------------------------------------------
 
 def _ecidentify_thar(thar_ec, coordlist="linelists$thar.dat"):
@@ -1182,8 +1187,10 @@ def _ecreidentify_thar(thar_ec, ref_thar_ec, drift_log_path=None, drift_stage="s
         If True, retry once with shift=INDEF when hinted call fails.
     """
     reference_input = reference_override if reference_override else ref_thar_ec
-    iraf_target_token = iraf_spec_token(thar_ec)
-    iraf_reference_token = iraf_spec_token(reference_input)
+    # ecreidentify expects image names as they appear in DB begin records,
+    # which for this pipeline are FITS basenames (not stem-only tokens).
+    iraf_target_token = os.path.basename(thar_ec)
+    iraf_reference_token = os.path.basename(reference_input)
 
     found_db = None
     for probe in (reference_input, os.path.basename(reference_input), stem(reference_input), iraf_reference_token):
@@ -1509,28 +1516,42 @@ def _dispcor_one(obj_ec, output_spec):
     """
     iraf_delete(output_spec)
     print(f"  dispcor: {obj_ec}  ->  {output_spec}")
-    iraf.noao.onedspec.dispcor.unlearn()
-    iraf.noao.onedspec.dispcor(
-        input    = obj_ec,
-        output   = output_spec,
-        lineariz = iraf.yes,
-        database = "database",
-        table    = "",
-        w1       = "INDEF",
-        w2       = "INDEF",
-        dw       = "INDEF",
-        nw       = "INDEF",
-        log      = iraf.no,
-        flux     = iraf.yes,
-        blank    = 0.0,
-        samedisp = iraf.no,
-        ignoreap = iraf.no,
-        confirm  = iraf.no,
-        listonl  = iraf.no,
-        verbose  = iraf.yes,
-        logfile  = "",
-        mode     = "ql",
-    )
+    dispcor_task = iraf.noao.onedspec.dispcor
+    dispcor_task.unlearn()
+
+    params = {
+        "input": obj_ec,
+        "output": output_spec,
+        "linearize": iraf.yes,
+        "database": "database",
+        "table": "",
+        "w1": "INDEF",
+        "w2": "INDEF",
+        "dw": "INDEF",
+        "nw": "INDEF",
+        "log": iraf.no,
+        "flux": iraf.yes,
+        "blank": 0.0,
+        "samedisp": iraf.no,
+        "global": iraf.no,
+        "ignoreaps": iraf.no,
+        "confirm": iraf.no,
+        "listonly": iraf.no,
+        "verbose": iraf.yes,
+        "logfile": "",
+        "mode": "ql",
+    }
+
+    try:
+        dispcor_task(**params)
+    except TypeError:
+        # Compatibility fallback for IRAF/PyRAF variants that expose short names.
+        compat = dict(params)
+        compat.pop("global", None)
+        compat["lineariz"] = compat.pop("linearize")
+        compat["ignoreap"] = compat.pop("ignoreaps")
+        compat["listonl"] = compat.pop("listonly")
+        dispcor_task(**compat)
 
 
 def _choose_step8_mode(step8_mode):
@@ -1598,7 +1619,7 @@ def manual_wavelength_identification(crr2_outputs, thar_outputs,
     Manual mode runs ecidentify on one reference-star ThAr spectrum.
     Reuse mode runs ecreidentify on that reference star, using an already
     identified external ThAr reference and its existing IRAF DB entry.
-    Both modes then run refspec on the reference-star object spectrum.
+    Refspec assignment is deferred to step 10.
 
     The reference star is the first star (minimum) in the star list.
 
@@ -1642,18 +1663,23 @@ def manual_wavelength_identification(crr2_outputs, thar_outputs,
     else:
         # 8a-alt – reuse external identified reference via ecreidentify.
         ref_thar_external = _resolve_reuse_reference_thar(step8_reference_thar)
-        print(
-            "  reuse mode: ecreidentify on reference star using existing identified ThAr"
-        )
-        _ecreidentify_thar(
-            thar_ec_ref,
-            ref_thar_external,
-            drift_log_path=drift_log_path,
-            drift_stage="step8_reuse",
-        )
+        if stem(ref_thar_external) == stem(thar_ec_ref):
+            print(
+                "  reuse mode: reference-star ThAr already matches reuse reference; "
+                "skipping self-reidentify"
+            )
+        else:
+            print(
+                "  reuse mode: ecreidentify on reference star using existing identified ThAr"
+            )
+            _ecreidentify_thar(
+                thar_ec_ref,
+                ref_thar_external,
+                drift_log_path=drift_log_path,
+                drift_stage="step8_reuse",
+            )
 
-    # 8b – refspec: attach ThAr solution to the reference object
-    _refspec_one(obj_crr2_ref, thar_ec_ref)
+    print("  Step 8 complete: reference ThAr wavelength solution ready for steps 9/10/11")
 
     return ref_star
 
@@ -1669,7 +1695,7 @@ def auto_wavelength_propagation(crr2_outputs, thar_outputs, ref_star,
                                 step5_geometry_path=None,
                                 extraction_pairs_path=None):
     """Step 9: automatic line-ID propagation and required review for non-reference stars."""
-    section_banner("Step 9 – Automatic line-ID propagation (ecreidentify + review + refspec)")
+    section_banner("Step 9 – Automatic line-ID propagation (ecreidentify + review + transfer-back)")
     iraf.noao()
     iraf.echelle()
     iraf.onedspec()
@@ -1681,7 +1707,7 @@ def auto_wavelength_propagation(crr2_outputs, thar_outputs, ref_star,
             f"Could not read APNUM apertures from master reference ThAr: {thar_ec_ref}"
         )
 
-    id_assigned_outputs = {}
+    reviewed_thar_outputs = {}
     failed_gate_stars = []
 
     if step9_gate_mode != "off":
@@ -1711,10 +1737,11 @@ def auto_wavelength_propagation(crr2_outputs, thar_outputs, ref_star,
         print(f"\n  -- Star {star:02d}")
         print(f"     object : {obj_crr2}")
         print(f"     thar   : {thar_ec}")
-        print(f"     output : {obj_crr2}  (line IDs assigned in-place)")
+        print(f"     output : {thar_ec}  (reviewed line IDs in IRAF DB)")
 
         if star == ref_star:
             print("     (reference star — solution from step 8)")
+            reviewed_thar_outputs[star] = thar_ec
         else:
             target_apertures, aperture_source = get_target_aperture_numbers(
                 star,
@@ -1747,6 +1774,7 @@ def auto_wavelength_propagation(crr2_outputs, thar_outputs, ref_star,
                     drift_log_path=drift_log_path,
                     drift_stage="step9_propagation",
                 )
+                print("     ecreidentify     : complete")
 
                 if step9_gate_mode != "off":
                     gate_ok, failures = evaluate_reidentify_quality(
@@ -1760,7 +1788,7 @@ def auto_wavelength_propagation(crr2_outputs, thar_outputs, ref_star,
                     else:
                         failure_text = "; ".join(failures)
                         print(f"     gate: FAIL ({failure_text})")
-                        print("     gate action: skipping review/refspec for this star")
+                        print("     gate action: skipping review/transfer-back for this star")
                         failed_gate_stars.append(star)
                         gate_failed = True
 
@@ -1769,16 +1797,18 @@ def auto_wavelength_propagation(crr2_outputs, thar_outputs, ref_star,
                     _review_reidentified_lines(prep["temp_target_path"], coordlist=coordlist)
                     print("     review end       : ecidentify complete")
 
+                    print("     db transfer start: temporary target -> real target identity")
                     transfer = _transfer_reviewed_temp_target_solution_to_real_target(
                         prep["temp_target_path"],
                         thar_ec,
                         prep["master_to_target"],
                     )
                     print(
-                        "     db transfer      : "
+                        "     db transfer end  : "
                         f"{os.path.basename(transfer['temp_db_path'])} -> "
                         f"{os.path.basename(transfer['real_db_path'])}"
                     )
+                    reviewed_thar_outputs[star] = thar_ec
             finally:
                 if prep is not None:
                     removed, failed = _cleanup_temporary_reference_artifacts(
@@ -1793,27 +1823,311 @@ def auto_wavelength_propagation(crr2_outputs, thar_outputs, ref_star,
             if gate_failed:
                 continue
 
-        print("     step9 sequence: applying refspec")
-        _refspec_one(obj_crr2, thar_ec)
-        id_assigned_outputs[star] = obj_crr2
+            continue
 
     if failed_gate_stars:
         failed_text = ", ".join(f"{s:02d}" for s in failed_gate_stars)
         print(f"\n  Step 9 gate skipped stars: {failed_text}")
         print("  These stars need manual fallback (step 8-style identification path).")
 
-    return id_assigned_outputs
+    return {
+        "reviewed_thar_outputs": reviewed_thar_outputs,
+        "failed_gate_stars": failed_gate_stars,
+    }
+
+
+def apply_refspec_to_objects(crr2_outputs, thar_outputs, skip_stars=None):
+    """Step 10: assign reviewed ThAr solutions to CR-cleaned object spectra."""
+    section_banner("Step 10 – Refspec assignment to CR-cleaned object spectra")
+    iraf.noao()
+    iraf.onedspec()
+
+    refspec_outputs = {}
+    skip_stars = set(skip_stars or [])
+
+    for star in sorted(crr2_outputs):
+        obj_crr2 = crr2_outputs[star]
+        thar_ec = thar_outputs.get(star)
+
+        print(f"\n  -- Star {star:02d}")
+        print(f"     object file      : {obj_crr2}")
+
+        if thar_ec is None:
+            print("     skip reason      : missing ThAr extraction for this star")
+            continue
+
+        print(f"     real target ThAr : {thar_ec}")
+
+        if star in skip_stars:
+            print("     skip reason      : Step 9 gate failed for this star in this run")
+            continue
+
+        found_db, db_candidates = resolve_existing_wavelength_db(thar_ec)
+        if not found_db:
+            print("     skip reason      : no reviewed ThAr wavelength DB solution found")
+            print(f"     checked DB paths : {', '.join(db_candidates)}")
+            continue
+
+        ensure_wavelength_db_aliases(thar_ec, found_db)
+        print(f"     wavelength DB    : {found_db}")
+        print("     refspec start    : real object <- real target")
+        _refspec_one(obj_crr2, thar_ec)
+        print("     refspec end      : assignment complete")
+        refspec_outputs[star] = obj_crr2
+
+    return refspec_outputs
+
+
+def object_has_refspec_assignment(obj_ec):
+    """Return (ok, token_or_reason) for object-side refspec assignment readiness."""
+    try:
+        hdr = fits.getheader(obj_ec)
+    except Exception as exc:
+        return False, f"could not read FITS header ({exc})"
+
+    refspec_keys = [
+        k for k in hdr.keys()
+        if str(k) == "REFSPEC" or re.match(r"^REFSPEC\d+$", str(k))
+    ]
+    if not refspec_keys:
+        return False, "missing REFSPEC assignment in object header"
+
+    for key in sorted(refspec_keys):
+        token = str(hdr.get(key, "")).strip()
+        if token and token.upper() not in {"INDEF", "NONE"}:
+            return True, token
+
+    return False, "REFSPEC assignment is empty/undefined in object header"
+
+
+def thar_db_has_dispersion_function(thar_ref_token_or_path, resolved_db_path=None):
+    """Return (ok, details) for usable echelle dispersion function in ThAr DB."""
+    ref_token = str(thar_ref_token_or_path).strip()
+    if not ref_token:
+        return False, "empty ThAr reference token"
+
+    db_path = resolved_db_path
+    db_candidates = []
+    if not db_path:
+        db_path, db_candidates = resolve_existing_wavelength_db(ref_token)
+    if not db_path:
+        return False, (
+            f"missing wavelength DB for REFSPEC token '{ref_token}' "
+            f"(checked: {', '.join(db_candidates)})"
+        )
+
+    try:
+        with open(db_path, "r") as fh:
+            lines = fh.readlines()
+    except OSError as exc:
+        return False, f"could not read wavelength DB '{db_path}' ({exc})"
+
+    exact_found = False
+    exact_with_coeff = False
+    variant_with_coeff = []
+    current_image = None
+    current_coeff = None
+
+    def _flush_record(image_token, coeff_count):
+        nonlocal exact_found, exact_with_coeff, variant_with_coeff
+        if image_token is None:
+            return
+        image_text = str(image_token).strip()
+        if not image_text:
+            return
+        has_coeff = coeff_count is not None and coeff_count > 0
+        if image_text == ref_token:
+            exact_found = True
+            if has_coeff:
+                exact_with_coeff = True
+            return
+
+        # Keep variant tracking to explain mismatch cases clearly.
+        if has_coeff:
+            if stem(image_text) == stem(ref_token):
+                variant_with_coeff.append(image_text)
+
+    for raw in lines:
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("#"):
+            continue
+
+        if line.startswith("begin"):
+            _flush_record(current_image, current_coeff)
+            parts = line.split()
+            current_image = parts[2] if len(parts) >= 3 else None
+            current_coeff = None
+            continue
+
+        if current_image is None:
+            continue
+
+        if line.startswith("coefficients"):
+            parts = line.split()
+            if len(parts) >= 2:
+                try:
+                    current_coeff = int(float(parts[1]))
+                except ValueError:
+                    current_coeff = 0
+
+    _flush_record(current_image, current_coeff)
+
+    if exact_with_coeff:
+        return True, db_path
+
+    if exact_found:
+        return False, (
+            f"DB exists ({db_path}) but REFSPEC record '{ref_token}' lacks usable coefficients"
+        )
+
+    if variant_with_coeff:
+        variant_text = ", ".join(sorted(set(variant_with_coeff)))
+        return False, (
+            f"DB exists ({db_path}) but no coefficient record matches REFSPEC token '{ref_token}' "
+            f"(found only variant record(s): {variant_text})"
+        )
+
+    return False, (
+        f"DB exists ({db_path}) but contains no usable echelle dispersion coefficients"
+    )
+
+
+def infer_step10_ready_outputs(crr2_outputs, thar_outputs):
+    """Infer stars eligible for step 11 from object-side refspec readiness."""
+    refspec_outputs = {}
+    skip_reasons = {}
+    readiness_sources = {}
+
+    for star in sorted(crr2_outputs):
+        obj_crr2 = crr2_outputs[star]
+        has_refspec, token_or_reason = object_has_refspec_assignment(obj_crr2)
+        if not has_refspec:
+            skip_reasons[star] = token_or_reason
+            continue
+
+        ref_token = token_or_reason
+
+        found_db, db_candidates = resolve_existing_wavelength_db(ref_token)
+        if not found_db:
+            skip_reasons[star] = (
+                "object has REFSPEC assignment but referenced wavelength DB is missing "
+                f"({', '.join(db_candidates)})"
+            )
+            continue
+
+        ensure_wavelength_db_aliases(ref_token, found_db)
+        has_disp, disp_details = thar_db_has_dispersion_function(
+            ref_token,
+            resolved_db_path=found_db,
+        )
+        if not has_disp:
+            skip_reasons[star] = (
+                "object has REFSPEC assignment but DB dispersion validation failed "
+                f"({disp_details})"
+            )
+            continue
+
+        # Optional cross-check only; this is not the readiness criterion.
+        thar_ec = thar_outputs.get(star)
+        if thar_ec is None:
+            skip_reasons[star] = "missing ThAr extraction for this star"
+            continue
+
+        refspec_outputs[star] = obj_crr2
+        readiness_sources[star] = f"standalone object header check ({ref_token})"
+
+    return refspec_outputs, skip_reasons, readiness_sources
+
+
+def apply_dispcor_to_objects(refspec_outputs, crr2_outputs=None, skip_reasons=None,
+                             readiness_sources=None):
+    """Step 11: run dispcor on the stars that successfully passed step 10."""
+    section_banner("Step 11 – Dispcor wavelength linearization")
+    iraf.noao()
+    iraf.onedspec()
+
+    dispcor_outputs = {}
+    crr2_outputs = dict(crr2_outputs or {})
+    skip_reasons = dict(skip_reasons or {})
+    readiness_sources = dict(readiness_sources or {})
+    star_order = sorted(set(crr2_outputs.keys()) | set(refspec_outputs.keys()))
+
+    for star in star_order:
+        input_obj = refspec_outputs.get(star, crr2_outputs.get(star))
+        if input_obj is None:
+            continue
+
+        output_dc = stem(input_obj) + "-dc.fits"
+
+        print(f"\n  -- Star {star:02d}")
+        print(f"     input object     : {input_obj}")
+        print(f"     output dispcor   : {output_dc}")
+
+        if star not in refspec_outputs:
+            reason = skip_reasons.get(star, "no successful Step 10 refspec output for this star")
+            print(f"     skip reason      : {reason}")
+            continue
+
+        source = readiness_sources.get(star, "same-session Step 10 output")
+        print(f"     readiness source : {source}")
+
+        has_refspec, token_or_reason = object_has_refspec_assignment(input_obj)
+        if not has_refspec:
+            print(f"     skip reason      : {token_or_reason}")
+            continue
+
+        ref_token = token_or_reason
+        print(f"     REFSPEC token    : {ref_token}")
+
+        found_db, db_candidates = resolve_existing_wavelength_db(ref_token)
+        if not found_db:
+            print("     dispersion check : FAIL")
+            print(
+                "     skip reason      : "
+                "referenced ThAr DB is missing for this REFSPEC token"
+            )
+            print(f"     checked DB paths : {', '.join(db_candidates)}")
+            continue
+
+        print(f"     resolved DB path : {found_db}")
+        has_disp, disp_details = thar_db_has_dispersion_function(
+            ref_token,
+            resolved_db_path=found_db,
+        )
+        if not has_disp:
+            print("     dispersion check : FAIL")
+            print(f"     skip reason      : {disp_details}")
+            continue
+
+        print("     dispersion check : PASS")
+        print("     dispcor start    : wavelength linearization")
+        _dispcor_one(input_obj, output_dc)
+        print("     dispcor end      : output written")
+        dispcor_outputs[star] = output_dc
+
+    return dispcor_outputs
 
 
 def expected_step8_outputs(crr2_outputs):
-    """Return deterministic step-8 reference-star outputs (refspec in-place)."""
-    ref_star = min(crr2_outputs.keys())
-    return {ref_star: crr2_outputs[ref_star]}
+    """Return deterministic step-8 outputs (no new FITS files)."""
+    return {}
 
 
 def expected_step9_outputs(crr2_outputs):
-    """Return deterministic step-9 outputs (refspec assignment in-place)."""
+    """Return deterministic step-9 outputs (no new FITS files)."""
+    return {}
+
+
+def expected_step10_outputs(crr2_outputs):
+    """Return deterministic step-10 outputs (refspec assignment in-place)."""
     return {star: path for star, path in crr2_outputs.items()}
+
+
+def expected_step11_outputs(refspec_outputs):
+    """Return deterministic step-11 outputs (new dispcor products)."""
+    return {star: stem(path) + "-dc.fits" for star, path in refspec_outputs.items()}
 
 
 # ---------------------------------------------------------------------------
@@ -1834,7 +2148,9 @@ def parse_args():
               6. Per-star extraction with accepted pattern  ->  *_starNN_ec.fits
               7. Second CR removal (lineclean)  ->  *_ec-crr2.fits
               8. Reference-star wavelength setup (manual/reuse)
-              9. Automatic wavelength propagation + review + refspec
+              9. Automatic wavelength propagation + review + transfer-back
+             10. Refspec assignment to CR-cleaned object spectra
+             11. Dispcor wavelength linearization  ->  *_ec-crr2-dc.fits
         """),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1876,10 +2192,10 @@ def parse_args():
                    help="Total apertures expected (default: IRAF auto-detect).")
     p.add_argument("--dispaxis", type=int, default=1, choices=[1, 2],
                    help="Dispersion axis: 1=columns, 2=rows (default: 1).")
-    p.add_argument("--start-step", type=int, default=1, choices=[1, 2, 3, 4, 5, 6, 7, 8, 9],
+    p.add_argument("--start-step", type=int, default=1, choices=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
                    help="First pipeline step to execute (default: 1).")
-    p.add_argument("--end-step", type=int, default=9, choices=[1, 2, 3, 4, 5, 6, 7, 8, 9],
-                   help="Last pipeline step to execute (default: 9).")
+    p.add_argument("--end-step", type=int, default=11, choices=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+                   help="Last pipeline step to execute (default: 11).")
     p.add_argument("--use-auto-pattern", action="store_true",
                    help="Allow step 6 without step 5 by using fallback auto pattern.")
     p.add_argument("--affiliation-map", default=None,
@@ -1918,7 +2234,7 @@ def parse_args():
         choices=["off", "warn", "strict"],
         help=(
             "Step-9 quality gate behavior: off (disabled), warn (report failures), "
-            "strict (skip refspec assignment for failed stars)."
+            "strict (skip review/transfer-back for failed stars)."
         ),
     )
     p.add_argument(
@@ -3302,10 +3618,25 @@ def _prepare_temp_target_for_reidentify(master_ref_thar, target_thar, target_sta
     master_to_target = {int(dst): int(src) for src, dst in target_to_master.items()}
 
     temp_target_path = _create_temporary_target_fits(target_thar, target_star)
+    temp_db_path = None
+    master_db_path = None
     cleanup_db_candidates = wavelength_db_candidates(temp_target_path)
 
     try:
         _renumber_temporary_reference_fits(temp_target_path, target_to_master)
+        # Seed a temp DB entry so ecreidentify can resolve a valid target record.
+        temp_db_path, master_db_path, cleanup_db_candidates = _clone_temporary_reference_db(
+            master_ref_thar,
+            temp_target_path,
+        )
+        _renumber_temporary_reference_db(temp_db_path, temp_target_path, target_to_master)
+        for alias_probe in (
+            temp_target_path,
+            os.path.basename(temp_target_path),
+            stem(temp_target_path),
+            iraf_spec_token(temp_target_path),
+        ):
+            ensure_wavelength_db_aliases(alias_probe, temp_db_path)
     except Exception:
         _cleanup_temporary_reference_artifacts(temp_target_path, cleanup_db_candidates)
         raise
@@ -3317,6 +3648,8 @@ def _prepare_temp_target_for_reidentify(master_ref_thar, target_thar, target_sta
         "target_to_master": target_to_master,
         "master_to_target": master_to_target,
         "temp_target_path": temp_target_path,
+        "temp_db_path": temp_db_path,
+        "master_db_path": master_db_path,
         "cleanup_db_candidates": cleanup_db_candidates,
     }
 
@@ -4004,7 +4337,7 @@ def main():
                                     f"Step 7 requires extracted *_ec.fits inputs, but star {_s:02d} "
                                     f"has only CR-cleaned output: {ec_path}. "
                                     "Re-run step 6 with current extraction-only behavior, "
-                                    "or run step 8/9 directly if CR-cleaned spectra are already final."
+                                    "or run step 8/9/10/11 directly if CR-cleaned spectra are already final."
                                 )
                             ec_path = candidate_ec
                         require_existing(ec_path, f"step 7 input star {_s:02d} object ec")
@@ -4020,17 +4353,17 @@ def main():
             crr2_outputs = second_cosmic_removal(obj_outputs)
         state["crr2_outputs"] = crr2_outputs
 
-    elif 8 in selected_steps or 9 in selected_steps:
-        # Step 8/9 without step 7: expect step-7 outputs already on disk.
+    elif 8 in selected_steps or 9 in selected_steps or 10 in selected_steps or 11 in selected_steps:
+        # Step 8/9/10/11 without step 7: expect step-7 outputs already on disk.
         try:
             if not obj_outputs or not thar_outputs:
                 obj_outputs, thar_outputs = reconstruct_star_outputs_from_disk(args)
 
             crr2_outputs = {star: _prefer_crr2(path) for star, path in obj_outputs.items()}
             for _s, _p in crr2_outputs.items():
-                require_existing(_p, f"step 8/9 input star {_s:02d} object extracted")
+                require_existing(_p, f"step 8/9/10/11 input star {_s:02d} object extracted")
             for _s, _p in thar_outputs.items():
-                require_existing(_p, f"step 8/9 input star {_s:02d} thar extracted")
+                require_existing(_p, f"step 8/9/10/11 input star {_s:02d} thar extracted")
             state["crr2_outputs"] = crr2_outputs
         except Exception as exc:
             sys.exit(f"ERROR dependency check: {exc}")
@@ -4118,7 +4451,7 @@ def main():
                     f"(Checked: {', '.join(db_candidates)})"
                 )
         
-        id_assigned_outputs = auto_wavelength_propagation(
+        step9_result = auto_wavelength_propagation(
             crr2_outputs, thar_outputs, ref_star,
             coordlist=args.coordlist,
             drift_log_path=drift_log_path,
@@ -4130,7 +4463,67 @@ def main():
             step5_geometry_path=step5_geometry_path,
             extraction_pairs_path=extraction_pairs_path,
         )
-        state["id_assigned_outputs"] = id_assigned_outputs
+        state["step9_reviewed_thar_outputs"] = step9_result.get("reviewed_thar_outputs", {})
+        state["step9_failed_gate_stars"] = step9_result.get("failed_gate_stars", [])
+
+    # ── 10. Refspec assignment to CR-cleaned objects ────────────────────────
+    if 10 in selected_steps:
+        crr2_outputs = state.get("crr2_outputs", {})
+        if not crr2_outputs:
+            sys.exit("ERROR: step 10 has no CR-cleaned spectra to calibrate.")
+        if not thar_outputs:
+            sys.exit(
+                "ERROR dependency check: step 10 requires ThAr extractions. "
+                "Run step 6 first or include it in the step range."
+            )
+
+        refspec_outputs = apply_refspec_to_objects(
+            crr2_outputs,
+            thar_outputs,
+            skip_stars=state.get("step9_failed_gate_stars", []),
+        )
+        state["refspec_outputs"] = refspec_outputs
+
+    # ── 11. Dispcor wavelength linearization ────────────────────────────────
+    if 11 in selected_steps:
+        crr2_outputs = state.get("crr2_outputs", {})
+        if not crr2_outputs:
+            sys.exit("ERROR: step 11 has no CR-cleaned spectra to calibrate.")
+
+        if 10 in selected_steps:
+            refspec_outputs = state.get("refspec_outputs", {})
+            step11_skip_reasons = {
+                star: "no successful Step 10 refspec output for this star"
+                for star in crr2_outputs
+                if star not in refspec_outputs
+            }
+            step11_readiness_sources = {
+                star: "same-session Step 10 output"
+                for star in refspec_outputs
+            }
+        else:
+            if not thar_outputs:
+                sys.exit(
+                    "ERROR dependency check: step 11 requires ThAr extractions to validate "
+                    "existing step-10-ready stars. Run step 6 first or include it in the step range."
+                )
+            refspec_outputs, step11_skip_reasons, step11_readiness_sources = infer_step10_ready_outputs(
+                crr2_outputs,
+                thar_outputs,
+            )
+            state["refspec_outputs"] = refspec_outputs
+            print(
+                "  Step 11 standalone: inferred "
+                f"{len(refspec_outputs)} step-10-ready stars from object refspec assignments."
+            )
+
+        dispcor_outputs = apply_dispcor_to_objects(
+            refspec_outputs,
+            crr2_outputs=crr2_outputs,
+            skip_reasons=step11_skip_reasons,
+            readiness_sources=step11_readiness_sources,
+        )
+        state["dispcor_outputs"] = dispcor_outputs
 
     # ── Summary ───────────────────────────────────────────────────────────────
     section_banner("Pipeline complete")
@@ -4143,7 +4536,14 @@ def main():
         print(f"  Flat-corrected object: {state['obj_ff']}")
     if "twi_ff" in state:
         print(f"  Flat-corrected twi   : {state['twi_ff']}")
-    if obj_outputs or thar_outputs or state.get("crr2_outputs") or state.get("id_assigned_outputs"):
+    if (
+        obj_outputs or
+        thar_outputs or
+        state.get("crr2_outputs") or
+        state.get("step9_reviewed_thar_outputs") or
+        state.get("refspec_outputs") or
+        state.get("dispcor_outputs")
+    ):
         print("")
         for s in sorted(set(list(obj_outputs) + list(thar_outputs))):
             if s in obj_outputs:
@@ -4152,18 +4552,32 @@ def main():
                 print(f"         thar      : {thar_outputs[s]}")
             if s in state.get("crr2_outputs", {}):
                 print(f"         crr2      : {state['crr2_outputs'][s]}")
-            if s in state.get("id_assigned_outputs", {}):
-                print(f"         line IDs  : {state['id_assigned_outputs'][s]}")
-        if state.get("id_assigned_outputs"):
+            if s in state.get("step9_reviewed_thar_outputs", {}):
+                print(f"         line IDs  : {state['step9_reviewed_thar_outputs'][s]} (ThAr reviewed)")
+            if s in state.get("refspec_outputs", {}):
+                print(f"         refspec   : {state['refspec_outputs'][s]} (assigned)")
+            if s in state.get("dispcor_outputs", {}):
+                print(f"         dispcor   : {state['dispcor_outputs'][s]} (final)")
+        if state.get("dispcor_outputs"):
             print(
-                "\n  Step 9 complete: line IDs propagated/reviewed and assigned with refspec."
+                "\n  Step 11 complete: final dispcor wavelength-linearized spectra written."
+            )
+        elif state.get("refspec_outputs"):
+            print(
+                "\n  Step 10 complete: refspec assignments applied to CR-cleaned object spectra."
+            )
+        elif state.get("step9_reviewed_thar_outputs"):
+            print(
+                "\n  Step 9 complete: ThAr line IDs propagated/reviewed and transferred to real targets."
             )
         elif obj_outputs:
             print(
                 "\n  Next steps for each star:\n"
                 "    Step 7  lineclean         ->  *_star<N>_ec-crr2.fits\n"
-                "    Step 8  ecidentify on ThAr, refspec assignment (in-place)\n"
-                "    Step 9  ecreidentify + review + refspec assignment (in-place)\n"
+                "    Step 8  ecidentify/ecreidentify on reference ThAr\n"
+                "    Step 9  ecreidentify + required review + transfer-back to real target ThAr DB\n"
+                "    Step 10 refspec assignment on *_ec-crr2.fits (in-place)\n"
+                "    Step 11 dispcor linearization -> *_ec-crr2-dc.fits\n"
             )
 
 
