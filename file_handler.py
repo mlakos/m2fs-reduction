@@ -2,13 +2,266 @@ from astropy.table import Table
 from astropy.io import fits
 
 from datetime import datetime, timedelta
+import json
 
 import numpy as np
 import os
-from os.path import isfile, join
+import re
 import sys
 
-def construct_table_of_images(path_to_list, extra_columns=[]):
+
+CANONICAL_IMAGE_TYPES = {
+    'BIAS',
+    'MASTER_BIAS',
+    'DARK',
+    'DARK_MASTER',
+    'SCIENCE',
+    'TWILIGHT',
+    'QUARTZ',
+    'LAMP',
+    'FIBERMAP',
+    'UNKNOWN',
+}
+
+USER_CLASS_TO_IMAGE_TYPE = {
+    'object': 'SCIENCE',
+    'dark': 'DARK',
+    'flat': 'QUARTZ',
+    'twilight': 'TWILIGHT',
+    'lamp': 'LAMP',
+    'fibermap': 'FIBERMAP',
+}
+
+
+def normalize_header_value(value):
+    """Normalize a FITS header value for deterministic matching."""
+    text = '' if value is None else str(value)
+    text = text.strip().lower()
+    text = re.sub(r'\s+', ' ', text)
+    return text
+
+
+def _normalized_signature(exptype_norm, object_norm):
+    return f'exptype={exptype_norm}|object={object_norm}'
+
+
+def _resolve_override_path(override_path=None):
+    if override_path is not None:
+        return override_path
+    return os.path.join(os.path.dirname(__file__), 'image_type_overrides.json')
+
+
+def _normalize_override_value(value):
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    upper = text.upper()
+    if upper in CANONICAL_IMAGE_TYPES:
+        return upper
+    lower = text.lower()
+    if lower in USER_CLASS_TO_IMAGE_TYPE:
+        return USER_CLASS_TO_IMAGE_TYPE[lower]
+    return None
+
+
+def load_image_type_overrides(override_path=None):
+    """Load image-type overrides keyed by normalized EXPTYPE/OBJECT signature."""
+    path = _resolve_override_path(override_path)
+    if not os.path.exists(path):
+        return {}, path
+
+    try:
+        with open(path) as fh:
+            payload = json.load(fh)
+    except Exception as exc:
+        print(f'WARNING: failed to read overrides from {path}: {exc}')
+        return {}, path
+
+    if isinstance(payload, dict) and isinstance(payload.get('mappings'), dict):
+        raw_map = payload['mappings']
+    elif isinstance(payload, dict):
+        raw_map = payload
+    else:
+        raw_map = {}
+
+    cleaned = {}
+    for key, value in raw_map.items():
+        mapped = _normalize_override_value(value)
+        if mapped:
+            cleaned[str(key)] = mapped
+    return cleaned, path
+
+
+def save_image_type_overrides(overrides, override_path=None):
+    """Persist image-type overrides in a small JSON file."""
+    path = _resolve_override_path(override_path)
+    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+    payload = {
+        'version': 1,
+        'mappings': dict(sorted(overrides.items())),
+    }
+    with open(path, 'w') as fh:
+        json.dump(payload, fh, indent=2, sort_keys=True)
+        fh.write('\n')
+    return path
+
+
+def classify_image_type(exptype_norm, object_norm, overrides=None):
+    """Classify one exposure into a canonical IMAGE_TYPE and CLASS_REASON."""
+    overrides = overrides or {}
+    signature = _normalized_signature(exptype_norm, object_norm)
+
+    bias_aliases = {'bias', 'zero'}
+    master_bias_aliases = {'master bias', 'master_bias', 'bias master', 'bias_master'}
+    dark_aliases = {'dark'}
+    dark_master_aliases = {'dark master', 'dark_master', 'master dark', 'master_dark'}
+
+    # 1) EXPTYPE-driven classes first.
+    if exptype_norm in bias_aliases:
+        return 'BIAS', 'exptype_bias_zero'
+    if exptype_norm in master_bias_aliases:
+        return 'MASTER_BIAS', 'exptype_master_bias'
+    if exptype_norm in dark_aliases:
+        return 'DARK', 'exptype_dark'
+    if exptype_norm in dark_master_aliases:
+        return 'DARK_MASTER', 'exptype_dark_master'
+
+    has_twilight = ('twilight' in object_norm) or ('dawn sky' in object_norm)
+    has_quartz = (
+        ('quartz' in object_norm) or
+        ('flat' in object_norm) or
+        ('domeflat' in object_norm) or
+        ('dome flat' in object_norm)
+    )
+    has_lamp = (
+        ('thar' in object_norm) or
+        ('tharne' in object_norm) or
+        ('thne' in object_norm) or
+        ('lamp' in object_norm) or
+        ('arc' in object_norm)
+    )
+    has_fibermap = (
+        ('fibermap' in object_norm) or
+        ('fiber map' in object_norm) or
+        ('fibre map' in object_norm) or
+        ('fibremap' in object_norm)
+    )
+
+    calibration_hits = int(has_twilight) + int(has_quartz) + int(has_lamp) + int(has_fibermap)
+    if calibration_hits > 1 and signature in overrides:
+        return overrides[signature], 'override_ambiguous_object_tokens'
+    if calibration_hits > 1:
+        return 'UNKNOWN', 'ambiguous_object_tokens'
+
+    # 2) OBJECT-driven subclasses.
+    if has_quartz:
+        return 'QUARTZ', 'object_quartz_flat_like'
+    if has_lamp:
+        return 'LAMP', 'object_lamp_like'
+    if has_twilight:
+        return 'TWILIGHT', 'object_twilight_like'
+    if has_fibermap:
+        return 'FIBERMAP', 'object_fibermap_like'
+
+    science_aliases = {'object', 'science', 'target', 'star'}
+    if object_norm in science_aliases:
+        return 'SCIENCE', 'object_science_alias'
+
+    # 3) EXPTYPE fallback.
+    if exptype_norm == 'lamp':
+        return 'LAMP', 'exptype_fallback_lamp'
+    if exptype_norm == 'object':
+        bookkeeping_tokens = (
+            'bias', 'dark', 'flat', 'quartz', 'lamp', 'thar',
+            'arc', 'twilight', 'fiber', 'fibre', 'calib', 'config'
+        )
+        if not any(token in object_norm for token in bookkeeping_tokens):
+            return 'SCIENCE', 'exptype_fallback_object'
+
+    # Apply persisted user override before UNKNOWN fallback.
+    if signature in overrides:
+        return overrides[signature], 'override_unresolved_signature'
+
+    # 4) Unknown.
+    return 'UNKNOWN', 'unknown_fallback'
+
+
+def _iter_ambiguous_groups(table, overrides, min_count=2):
+    signatures = {}
+    for idx, row in enumerate(table):
+        signature = _normalized_signature(row['EXPTYPE_NORM'], row['OBJECT_NORM'])
+        signatures.setdefault(signature, []).append(idx)
+
+    ambiguous = []
+    for signature, indices in signatures.items():
+        if len(indices) < min_count:
+            continue
+        if signature in overrides:
+            continue
+
+        reasons = {str(table[i]['CLASS_REASON']) for i in indices}
+        image_types = {str(table[i]['IMAGE_TYPE']) for i in indices}
+        if image_types == {'UNKNOWN'} or 'ambiguous_object_tokens' in reasons:
+            sample = table[indices[0]]
+            ambiguous.append({
+                'signature': signature,
+                'count': len(indices),
+                'indices': indices,
+                'exptype_norm': str(sample['EXPTYPE_NORM']),
+                'object_norm': str(sample['OBJECT_NORM']),
+            })
+    return sorted(ambiguous, key=lambda item: (-item['count'], item['signature']))
+
+
+def _prompt_ambiguous_classifications(ambiguous_groups):
+    prompts = {}
+    choices = '/'.join(USER_CLASS_TO_IMAGE_TYPE.keys())
+    print('\nAmbiguous recurring subsets detected:')
+    for group in ambiguous_groups:
+        print(
+            f"  - EXPTYPE_NORM='{group['exptype_norm']}' "
+            f"OBJECT_NORM='{group['object_norm']}' count={group['count']}"
+        )
+
+    for group in ambiguous_groups:
+        while True:
+            answer = input(
+                "Classify subset "
+                f"(EXPTYPE_NORM='{group['exptype_norm']}', "
+                f"OBJECT_NORM='{group['object_norm']}') as "
+                f"[{choices}] (Enter to skip): "
+            ).strip().lower()
+            if not answer:
+                break
+            if answer in USER_CLASS_TO_IMAGE_TYPE:
+                prompts[group['signature']] = USER_CLASS_TO_IMAGE_TYPE[answer]
+                break
+            print(f"Invalid choice '{answer}'. Use one of: {choices}")
+    return prompts
+
+
+def _apply_classification_rows(table, overrides):
+    image_type = []
+    class_reason = []
+    for exptype_norm, object_norm in zip(table['EXPTYPE_NORM'], table['OBJECT_NORM']):
+        image_t, reason = classify_image_type(
+            str(exptype_norm), str(object_norm), overrides=overrides
+        )
+        image_type.append(image_t)
+        class_reason.append(reason)
+
+    table['IMAGE_TYPE'] = np.array(image_type, dtype='U16')
+    table['CLASS_REASON'] = np.array(class_reason, dtype='U64')
+    return table
+
+def construct_table_of_images(
+    path_to_list,
+    extra_columns=None,
+    override_path=None,
+    interactive=None,
+):
     '''
     Creates an astropy table from a list of input images.
     By default only the columns:\n
@@ -21,6 +274,9 @@ def construct_table_of_images(path_to_list, extra_columns=[]):
     filename_input (the actual filename in the input list)\n
     will be included in the table, extra columns may be added via the extra_column argument.
     '''
+    if extra_columns is None:
+        extra_columns = []
+
     prepath = os.path.dirname(path_to_list)
     list_file = open(path_to_list)
     
@@ -38,7 +294,48 @@ def construct_table_of_images(path_to_list, extra_columns=[]):
         rows.append(row)
         
     table_out = Table(rows)
-    table_out['filename_input'] = table_out['filename_input'].astype('U32')
+    table_out['filename_input'] = table_out['filename_input'].astype('U256')
+
+    table_out['EXPTYPE_NORM'] = np.array(
+        [normalize_header_value(v) for v in table_out['EXPTYPE']],
+        dtype='U128'
+    )
+    table_out['OBJECT_NORM'] = np.array(
+        [normalize_header_value(v) for v in table_out['OBJECT']],
+        dtype='U256'
+    )
+
+    overrides, resolved_override_path = load_image_type_overrides(override_path)
+    table_out = _apply_classification_rows(table_out, overrides)
+
+    ambiguous_groups = _iter_ambiguous_groups(table_out, overrides)
+    unresolved = [group['signature'] for group in ambiguous_groups]
+
+    if interactive is None:
+        interactive = sys.stdin.isatty()
+
+    if ambiguous_groups and interactive:
+        print(f"\nFound {len(ambiguous_groups)} ambiguous recurring subset(s).")
+        new_overrides = _prompt_ambiguous_classifications(ambiguous_groups)
+        if new_overrides:
+            overrides.update(new_overrides)
+            save_image_type_overrides(overrides, resolved_override_path)
+            table_out = _apply_classification_rows(table_out, overrides)
+            unresolved = [
+                signature for signature in unresolved if signature not in new_overrides
+            ]
+            print(
+                f"Saved {len(new_overrides)} classification override(s) to "
+                f"{resolved_override_path}"
+            )
+    elif ambiguous_groups:
+        print(
+            f"WARNING: {len(ambiguous_groups)} ambiguous recurring subset(s) "
+            "left as UNKNOWN in non-interactive mode."
+        )
+
+    table_out.meta['IMAGE_TYPE_OVERRIDE_PATH'] = resolved_override_path
+    table_out.meta['UNRESOLVED_AMBIGUOUS_SIGNATURES'] = unresolved
     
     list_file.close()
     return table_out
@@ -130,11 +427,12 @@ def generate_output_list(list_of_list_paths: list, suffix: str):
                 filenames.append(line.strip())
         
         lpath = split_path(list_path)
-        outlist_path = lpath[0]+lpath[1]+'-'+suffix+lpath[2]
+        outlist_path = os.path.join(lpath[0], lpath[1] + '-' + suffix + lpath[2])
         with open(outlist_path, 'w') as outlist:
             for impath in filenames:
                 outpath = split_path(impath.strip())
-                outlist.write(outpath[0]+outpath[1]+'-'+suffix+outpath[2]+'\n')
+            name = outpath[1] + '-' + suffix + outpath[2]
+            outlist.write(os.path.join(outpath[0], name) + '\n')
         outlists.append(outlist_path)
     return outlists
 

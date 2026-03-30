@@ -147,6 +147,18 @@ def section_banner(msg):
     print(f"\n{bar}\n  {msg}\n{bar}")
 
 
+def resolve_processing_dirs(input_dir):
+    """Resolve raw night directory and proc working directory."""
+    abs_input = os.path.abspath(input_dir)
+    if os.path.basename(abs_input) == 'proc':
+        proc_dir = abs_input
+        raw_dir = os.path.dirname(proc_dir)
+    else:
+        raw_dir = abs_input
+        proc_dir = os.path.join(raw_dir, 'proc')
+    return raw_dir, proc_dir
+
+
 def read_required_metadata(filepath):
     """Read required identity keys from a FITS header.
 
@@ -2311,7 +2323,7 @@ def parse_args():
     p.add_argument("--object", help="Science object mosaic FITS (manual override).")
     p.add_argument("--twilight", help="Twilight sky mosaic FITS (manual override).")
     p.add_argument("--input-dir", default=".",
-                   help="Directory to scan for auto-discovery (default: .).")
+                   help="Night directory (raw) or proc directory for auto-discovery (default: .).")
     p.add_argument("--run-preprocess", action="store_true",
                    help="Run image_processing.py on --input-dir before echelle steps.")
     p.add_argument("--preprocess-infiles", default=None,
@@ -2488,8 +2500,14 @@ def require_existing(path, requirement):
 
 
 def write_infiles_from_directory(input_dir, infiles_path=None):
-    """Create an image_processing-style infiles list from input_dir/*.fits."""
+    """Create an image_processing-style infiles list from raw per-chip FITS files."""
     fits_paths = sorted(glob.glob(os.path.join(input_dir, "*.fits")))
+    raw_like = [
+        path for path in fits_paths
+        if re.match(r"^[br]\d{4}c[1-4]\.fits$", os.path.basename(path), re.IGNORECASE)
+    ]
+    if raw_like:
+        fits_paths = raw_like
     if not fits_paths:
         raise RuntimeError(f"No FITS files found in input directory: {input_dir}")
 
@@ -2501,9 +2519,9 @@ def write_infiles_from_directory(input_dir, infiles_path=None):
     return out_path
 
 
-def run_image_preprocessing(args):
-    """Run image_processing.py in args.input_dir before echelle reduction."""
-    infiles_path = write_infiles_from_directory(args.input_dir, args.preprocess_infiles)
+def run_image_preprocessing(args, raw_input_dir):
+    """Run image_processing.py in the raw night directory before echelle reduction."""
+    infiles_path = write_infiles_from_directory(raw_input_dir, args.preprocess_infiles)
     script_path = os.path.join(os.path.dirname(__file__), "image_processing.py")
     cmd = [sys.executable, script_path, "--infiles", os.path.abspath(infiles_path)]
 
@@ -2517,7 +2535,7 @@ def run_image_preprocessing(args):
     print("  Launching preprocessing:")
     print("    " + " ".join(cmd))
     try:
-        subprocess.run(cmd, check=True, cwd=args.input_dir)
+        subprocess.run(cmd, check=True, cwd=raw_input_dir)
     except subprocess.CalledProcessError as exc:
         raise RuntimeError(
             f"image_processing.py failed with exit code {exc.returncode}"
@@ -4048,6 +4066,35 @@ def find_step2_outputs(input_dir, night, shoe):
 
 def main():
     args = parse_args()
+    launch_cwd = os.getcwd()
+
+    raw_input_dir, proc_dir = resolve_processing_dirs(args.input_dir)
+    os.makedirs(proc_dir, exist_ok=True)
+
+    # Processed products are discovered and generated in proc.
+    args.raw_input_dir = raw_input_dir
+    args.proc_dir = proc_dir
+    args.input_dir = proc_dir
+
+    # Resolve relative path-like arguments before changing directories.
+    search_dirs = [launch_cwd, raw_input_dir, proc_dir]
+    for attr in [
+        'quartz',
+        'quartz_reference',
+        'thar',
+        'object',
+        'twilight',
+        'step8_reference_thar',
+        'preprocess_infiles',
+        'preprocess_flat',
+        'affiliation_map',
+    ]:
+        value = getattr(args, attr, None)
+        if value:
+            setattr(args, attr, _resolve_existing_path(value, search_dirs))
+
+    print(f"Raw input directory : {raw_input_dir}")
+    print(f"Processing directory: {proc_dir}")
 
     if args.step9_min_found_frac < 0.0 or args.step9_min_found_frac > 1.0:
         sys.exit("ERROR: --step9-min-found-frac must be within [0, 1].")
@@ -4066,16 +4113,26 @@ def main():
         if 1 in selected_steps:
             section_banner("Preprocessing prelude (image_processing.py)")
             try:
-                run_image_preprocessing(args)
+                run_image_preprocessing(args, raw_input_dir=raw_input_dir)
             except Exception as exc:
                 sys.exit(f"ERROR preprocessing: {exc}")
         else:
             print("  [info] --run-preprocess requested, but start-step > 1; skipping preprocessing.")
 
     try:
+        os.chdir(proc_dir)
+    except Exception as exc:
+        sys.exit(f"ERROR changing directory to proc: {exc}")
+
+    try:
         resolved = resolve_inputs(args, required_roles=required_roles)
     except Exception as exc:
         sys.exit(f"ERROR resolving inputs: {exc}")
+
+    resolved = {
+        role: _resolve_existing_path(path, [launch_cwd, raw_input_dir, proc_dir])
+        for role, path in resolved.items()
+    }
 
     for role, path in resolved.items():
         if not os.path.exists(path):
@@ -4112,6 +4169,8 @@ def main():
     print("  McDonald echelle reduction pipeline")
     print("="*72)
     for label, val in [
+            ("raw_dir",  raw_input_dir),
+            ("proc_dir", proc_dir),
             ("quartz",   quartz if quartz else "<not required>"),
             ("quartz_ref", quartz_ref if quartz_ref else "<not required>"),
             ("thar",     thar if thar else "<not required>"),
