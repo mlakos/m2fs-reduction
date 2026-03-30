@@ -431,8 +431,8 @@ def generate_output_list(list_of_list_paths: list, suffix: str):
         with open(outlist_path, 'w') as outlist:
             for impath in filenames:
                 outpath = split_path(impath.strip())
-            name = outpath[1] + '-' + suffix + outpath[2]
-            outlist.write(os.path.join(outpath[0], name) + '\n')
+                name = outpath[1] + '-' + suffix + outpath[2]
+                outlist.write(os.path.join(outpath[0], name) + '\n')
         outlists.append(outlist_path)
     return outlists
 

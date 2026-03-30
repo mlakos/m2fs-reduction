@@ -109,6 +109,30 @@ def stem(path):
     return os.path.splitext(os.path.basename(path))[0]
 
 
+def _safe_token(value):
+    """Return a filename-safe token from arbitrary metadata text."""
+    text = str(value or "").strip()
+    text = re.sub(r"\s+", "_", text)
+    text = re.sub(r"[^A-Za-z0-9._-]", "-", text)
+    return text or "na"
+
+
+def _first_nonblank(values):
+    """Return first non-empty string from values, otherwise empty string."""
+    for value in values:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _normalize_token_text(value):
+    """Normalize free-form text for stable tokenization."""
+    text = str(value or "").strip().lower()
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+
 def canonical_wavelength_identity(path_or_token):
     """Return canonical IRAF wavelength identity token (bare root, no .fits)."""
     text = str(path_or_token or "").strip().strip("\"'")
@@ -177,8 +201,10 @@ def read_required_metadata(filepath):
         "path": filepath,
         "OBJECT": str(hdr["OBJECT"]),
         "EXPTYPE": str(hdr["EXPTYPE"]),
+        "IMAGE_TYPE": str(hdr.get("IMAGE_TYPE", "")).strip().upper(),
         "NIGHT": str(hdr["NIGHT"]),
         "SHOE": str(hdr["SHOE"]),
+        "PLATE": str(hdr.get("PLATE", "")).strip(),
         "STACKED": bool(hdr.get("STACKED", False)),
         "STACKTYPE": str(hdr.get("STACKTYPE", "")),
         "STACKMOD": str(hdr.get("STACKMOD", "")),
@@ -225,6 +251,18 @@ def is_pipeline_intermediate(path):
 
 def classify_role(meta):
     """Classify a frame role from FITS header metadata."""
+    image_type = str(meta.get("IMAGE_TYPE", "")).strip().upper()
+    if image_type == "SCIENCE":
+        return "object"
+    if image_type == "QUARTZ":
+        return "quartz"
+    if image_type == "LAMP":
+        return "thar"
+    if image_type == "TWILIGHT":
+        return "twilight"
+    if image_type in {"FIBERMAP", "UNKNOWN", "BIAS", "MASTER_BIAS", "DARK", "DARK_MASTER"}:
+        return None
+
     exptype = meta["EXPTYPE"].strip().lower()
     objname = meta["OBJECT"].strip().lower()
     text = f"{exptype} {objname}"
@@ -311,14 +349,15 @@ def _select_unique_candidate(role, candidates):
     for c in scored:
         rank = processing_rank(c)
         msg.append(
-            f"  - {c['path']}  (rank={rank}, EXPTYPE={c['EXPTYPE']}, "
-            f"OBJECT={c['OBJECT']}, NIGHT={c['NIGHT']}, SHOE={c['SHOE']})"
+            f"  - {c['path']}  (rank={rank}, IMAGE_TYPE={c.get('IMAGE_TYPE', '')}, "
+            f"EXPTYPE={c['EXPTYPE']}, OBJECT={c['OBJECT']}, NIGHT={c['NIGHT']}, "
+            f"SHOE={c['SHOE']}, PLATE={c.get('PLATE', '')})"
         )
     msg.append("Please pass an explicit --{role} file.")
     raise RuntimeError("\n".join(msg).replace("{role}", role))
 
 
-def discover_inputs(input_dir, night=None, shoe=None, object_name=None, required_roles=None):
+def discover_inputs(input_dir, night=None, shoe=None, plate=None, object_name=None, required_roles=None):
     """Auto-discover required role files from metadata-rich FITS products."""
     required_roles = set(required_roles or ("quartz", "thar", "object", "twilight"))
     fits_paths = sorted(glob.glob(os.path.join(input_dir, "*.fits")))
@@ -345,6 +384,8 @@ def discover_inputs(input_dir, night=None, shoe=None, object_name=None, required
             continue
         if shoe and str(meta["SHOE"]).upper() != str(shoe).upper():
             continue
+        if plate and str(meta.get("PLATE", "")) != str(plate):
+            continue
 
         role = classify_role(meta)
         if role is None:
@@ -366,6 +407,7 @@ def discover_inputs(input_dir, night=None, shoe=None, object_name=None, required
 
     inferred_night = night if night else (object_meta["NIGHT"] if object_meta else None)
     inferred_shoe = shoe if shoe else (object_meta["SHOE"] if object_meta else None)
+    inferred_plate = plate if plate else (object_meta.get("PLATE") if object_meta else None)
 
     for role in ("quartz", "thar", "twilight"):
         if role not in required_roles:
@@ -375,6 +417,10 @@ def discover_inputs(input_dir, night=None, shoe=None, object_name=None, required
             role_candidates = [c for c in role_candidates if str(c["NIGHT"]) == str(inferred_night)]
         if inferred_shoe is not None:
             role_candidates = [c for c in role_candidates if str(c["SHOE"]).upper() == str(inferred_shoe).upper()]
+        if inferred_plate not in (None, ""):
+            role_candidates = [
+                c for c in role_candidates if str(c.get("PLATE", "")) == str(inferred_plate)
+            ]
         selected_meta = _select_unique_candidate(role, role_candidates)
         if selected_meta is not None:
             selected[role] = selected_meta["path"]
@@ -410,6 +456,7 @@ def resolve_inputs(args, required_roles=None):
             args.input_dir,
             night=args.night,
             shoe=args.shoe,
+            plate=args.plate,
             object_name=args.object_name,
             required_roles=required_roles,
         )
@@ -434,10 +481,17 @@ def validate_input_set(meta_by_role, args):
     warnings = []
     nights = {meta_by_role[r]["NIGHT"] for r in meta_by_role}
     shoes = {meta_by_role[r]["SHOE"] for r in meta_by_role}
+    plates = {
+        str(meta_by_role[r].get("PLATE", "")).strip()
+        for r in meta_by_role
+        if str(meta_by_role[r].get("PLATE", "")).strip()
+    }
     if len(nights) != 1:
         warnings.append(f"Mixed NIGHT values: {sorted(nights)}")
     if len(shoes) != 1:
         warnings.append(f"Mixed SHOE values: {sorted(shoes)}")
+    if len(plates) > 1:
+        warnings.append(f"Mixed PLATE values: {sorted(plates)}")
 
     expected = {
         "quartz": "quartz",
@@ -450,7 +504,7 @@ def validate_input_set(meta_by_role, args):
         if role in expected and observed != expected[role]:
             warnings.append(
                 f"Role mismatch for {role}: metadata looks like '{observed}' "
-                f"(EXPTYPE={meta['EXPTYPE']}, OBJECT={meta['OBJECT']})"
+                f"(IMAGE_TYPE={meta.get('IMAGE_TYPE', '')}, EXPTYPE={meta['EXPTYPE']}, OBJECT={meta['OBJECT']})"
             )
 
     if not warnings:
@@ -707,8 +761,26 @@ def flatcorrect_images(thar, obj, twilight, master_flat):
     targets  = [thar, obj, twilight]
     outputs  = [stem(t) + "-F.fits" for t in targets]
 
-    in_list  = "_flatcorr_in.list"
-    out_list = "_flatcorr_out.list"
+    context_meta = None
+    for candidate in (obj, thar, twilight):
+        try:
+            context_meta = read_required_metadata(candidate)
+            break
+        except Exception:
+            continue
+
+    if context_meta:
+        night_tok = _safe_token(context_meta.get("NIGHT", "na"))
+        shoe_tok = _safe_token(context_meta.get("SHOE", "na"))
+        plate_val = str(context_meta.get("PLATE", "")).strip()
+        plate_tok = _safe_token(plate_val) if plate_val else "na"
+        obj_tok = _safe_token(_normalize_token_text(context_meta.get("OBJECT", "")))
+        list_tag = f"{night_tok}_{shoe_tok}_{plate_tok}_{obj_tok}"
+    else:
+        list_tag = "context_na"
+
+    in_list  = f"_flatcorr_{list_tag}_in.list"
+    out_list = f"_flatcorr_{list_tag}_out.list"
     write_list(in_list,  targets)
     write_list(out_list, outputs)
 
@@ -2326,6 +2398,13 @@ def parse_args():
                    help="Night directory (raw) or proc directory for auto-discovery (default: .).")
     p.add_argument("--run-preprocess", action="store_true",
                    help="Run image_processing.py on --input-dir before echelle steps.")
+    p.add_argument("--force-preprocess", action="store_true",
+                   help="Force preprocessing rerun instead of reusing compatible proc products.")
+    p.add_argument("--preprocess-from-step", type=int, default=None,
+                   choices=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+                   help="Resume preprocessing from this step (1-10).")
+    p.add_argument("--preprocess-only", action="store_true",
+                   help="Run preprocessing orchestration only and stop before echelle steps.")
     p.add_argument("--preprocess-infiles", default=None,
                    help="Output path for generated infiles list (default: <input-dir>/infiles).")
     p.add_argument("--preprocess-object", default=None,
@@ -2338,6 +2417,8 @@ def parse_args():
                    help="Restrict auto-discovery to this NIGHT value.")
     p.add_argument("--shoe", default=None, choices=["B", "R", "b", "r"],
                    help="Restrict auto-discovery to this SHOE value.")
+    p.add_argument("--plate", default=None,
+                   help="Restrict auto-discovery to this PLATE value.")
     p.add_argument("--object-name", default=None,
                    help="Substring filter applied to auto-discovered science OBJECT.")
     p.add_argument("--yes", action="store_true",
@@ -2382,7 +2463,7 @@ def parse_args():
         default=None,
         help=(
             "CSV path for ecreidentify drift metrics (steps 8/9). "
-            "Default: reidentify_drift_<NIGHT>_<SHOE>.csv when night/shoe are set, "
+            "Default: context-specific reidentify_drift_<NIGHT>_<SHOE>[_<PLATE>]_<OBJECT>.csv when inferable, "
             "otherwise reidentify_drift.csv."
         ),
     )
@@ -2519,14 +2600,265 @@ def write_infiles_from_directory(input_dir, infiles_path=None):
     return out_path
 
 
-def run_image_preprocessing(args, raw_input_dir):
-    """Run image_processing.py in the raw night directory before echelle reduction."""
+def _preprocess_variant_stage(path):
+    """Return preprocessing variant stage inferred from filename."""
+    name = os.path.basename(str(path)).lower()
+    if name.endswith("-mcrr.fits"):
+        return "mcrr"
+    if name.endswith("-d.fits"):
+        return "darksub"
+    if "-full" in name and name.endswith(".fits"):
+        return "mosaic"
+    return None
+
+
+def inspect_preprocess_state(proc_dir, night=None, shoe=None, plate=None,
+                             object_name=None, required_roles=None):
+    """Inspect proc products and summarize reusable preprocessing state."""
+    required_roles = set(required_roles or ("quartz", "thar", "object", "twilight"))
+    object_filter = str(object_name or "").strip().lower()
+    role_stage_sets = {role: set() for role in required_roles}
+    stacked_by_role = {role: [] for role in required_roles}
+
+    state = {
+        "proc_dir": proc_dir,
+        "required_roles": tuple(sorted(required_roles)),
+        "global_counts": {
+            "overscan_trim": len(glob.glob(os.path.join(proc_dir, "*-ot.fits"))),
+            "master_bias": len(glob.glob(os.path.join(proc_dir, "Master_bias_*.fits"))),
+            "mosaics": len(glob.glob(os.path.join(proc_dir, "*-full*.fits"))),
+        },
+        "dark_master_count": 0,
+        "dark_mosaic_count": 0,
+        "role_stage_sets": role_stage_sets,
+        "stacked_by_role": stacked_by_role,
+        "compatible_nonstacked": 0,
+        "incompatible_context_count": 0,
+    }
+
+    for path in sorted(glob.glob(os.path.join(proc_dir, "*.fits"))):
+        try:
+            meta = read_required_metadata(path)
+        except Exception:
+            continue
+
+        row_night = str(meta.get("NIGHT", ""))
+        row_shoe = str(meta.get("SHOE", ""))
+        row_plate = str(meta.get("PLATE", ""))
+        row_role = classify_role(meta)
+        row_image_type = str(meta.get("IMAGE_TYPE", "")).strip().upper()
+        row_object = str(meta.get("OBJECT", ""))
+
+        context_ok = True
+        if night is not None and row_night != str(night):
+            context_ok = False
+        if shoe is not None and row_shoe.upper() != str(shoe).upper():
+            context_ok = False
+        if plate is not None and row_plate != str(plate):
+            context_ok = False
+        if object_filter and row_role == "object" and object_filter not in row_object.lower():
+            context_ok = False
+
+        if not context_ok:
+            if (row_role in required_roles and is_stacked_product(meta)) or row_image_type == "DARK_MASTER":
+                state["incompatible_context_count"] += 1
+            continue
+
+        if row_image_type == "DARK_MASTER":
+            state["dark_master_count"] += 1
+        if row_image_type == "DARK" and _preprocess_variant_stage(path) == "mosaic":
+            state["dark_mosaic_count"] += 1
+
+        if row_role not in required_roles:
+            continue
+
+        if is_stacked_product(meta):
+            stacked_by_role[row_role].append(path)
+            continue
+
+        stage = _preprocess_variant_stage(path)
+        if stage is not None:
+            role_stage_sets[row_role].add(stage)
+            state["compatible_nonstacked"] += 1
+
+    stacked_present = {role for role, items in stacked_by_role.items() if items}
+    state["missing_roles"] = tuple(sorted(required_roles.difference(stacked_present)))
+    return state
+
+
+def choose_preprocess_plan(state, force_preprocess=False, preprocess_from_step=None):
+    """Choose preprocessing execution plan from inspected proc state."""
+    missing_roles = tuple(state.get("missing_roles", ()))
+
+    if preprocess_from_step is not None:
+        start_step = int(preprocess_from_step)
+        return {
+            "skip": False,
+            "start_step": start_step,
+            "resume_from_proc": start_step >= 6,
+            "reason": "explicit --preprocess-from-step",
+            "missing_roles": missing_roles,
+        }
+
+    if force_preprocess:
+        return {
+            "skip": False,
+            "start_step": 1,
+            "resume_from_proc": False,
+            "reason": "forced rerun (--force-preprocess)",
+            "missing_roles": missing_roles,
+        }
+
+    if not missing_roles:
+        return {
+            "skip": True,
+            "start_step": None,
+            "resume_from_proc": False,
+            "reason": "all required stacked products already exist",
+            "missing_roles": missing_roles,
+        }
+
+    stage_sets = state.get("role_stage_sets", {})
+    dark_master_count = int(state.get("dark_master_count", 0))
+    dark_mosaic_count = int(state.get("dark_mosaic_count", 0))
+
+    def _has_stage(role, stage_name):
+        return stage_name in set(stage_sets.get(role, set()))
+
+    if all(_has_stage(role, "mcrr") for role in missing_roles):
+        return {
+            "skip": False,
+            "start_step": 9,
+            "resume_from_proc": True,
+            "reason": "missing stacked products but CR-cleaned mosaics already exist",
+            "missing_roles": missing_roles,
+        }
+
+    if dark_master_count > 0 and all(_has_stage(role, "darksub") for role in missing_roles):
+        return {
+            "skip": False,
+            "start_step": 8,
+            "resume_from_proc": True,
+            "reason": "dark-subtracted mosaics found; resume at CR-cleaning/stacking",
+            "missing_roles": missing_roles,
+        }
+
+    if dark_master_count > 0 and all(
+        _has_stage(role, "mosaic") or _has_stage(role, "darksub") for role in missing_roles
+    ):
+        return {
+            "skip": False,
+            "start_step": 7,
+            "resume_from_proc": True,
+            "reason": "mosaics + dark master found; resume before dark subtraction",
+            "missing_roles": missing_roles,
+        }
+
+    if dark_mosaic_count > 0 and all(_has_stage(role, "mosaic") for role in missing_roles):
+        return {
+            "skip": False,
+            "start_step": 6,
+            "resume_from_proc": True,
+            "reason": "mosaic products found; resume at dark-master stage",
+            "missing_roles": missing_roles,
+        }
+
+    if all(
+        _has_stage(role, "mosaic") or _has_stage(role, "darksub") or _has_stage(role, "mcrr")
+        for role in missing_roles
+    ):
+        return {
+            "skip": False,
+            "start_step": 9,
+            "resume_from_proc": True,
+            "reason": "partial downstream products found; regenerate stacked outputs only",
+            "missing_roles": missing_roles,
+        }
+
+    return {
+        "skip": False,
+        "start_step": 1,
+        "resume_from_proc": False,
+        "reason": "insufficient reusable state; full preprocessing required",
+        "missing_roles": missing_roles,
+    }
+
+
+def _print_preprocess_state_summary(state, plan):
+    """Report detected preprocess state and chosen execution plan."""
+    g = state.get("global_counts", {})
+    print("  Preprocess state scan:")
+    print(
+        "    reusable globals: "
+        f"overscan+trim={g.get('overscan_trim', 0)}, "
+        f"master_bias={g.get('master_bias', 0)}, "
+        f"mosaics={g.get('mosaics', 0)}, "
+        f"dark_master={state.get('dark_master_count', 0)}"
+    )
+    print(f"    missing stacked roles: {list(plan.get('missing_roles', ())) or 'none'}")
+    if state.get("incompatible_context_count", 0) > 0:
+        print(
+            "  WARNING: found "
+            f"{state['incompatible_context_count']} proc product(s) outside requested context; "
+            "they will not be reused."
+        )
+    if plan.get("skip"):
+        print(f"  Preprocess decision: reuse existing products ({plan['reason']}).")
+    else:
+        mode = "resume-from-proc" if plan.get("resume_from_proc") else "full-from-raw"
+        print(
+            "  Preprocess decision: execute "
+            f"step {plan['start_step']}..10 ({mode}; {plan['reason']})."
+        )
+
+
+def run_image_preprocessing(args, raw_input_dir, required_roles):
+    """Run image_processing.py incrementally in the raw night directory when needed."""
+    proc_dir = getattr(args, "proc_dir", os.path.join(raw_input_dir, "proc"))
+    requested_object = args.preprocess_object or args.object_name
+
+    state = inspect_preprocess_state(
+        proc_dir,
+        night=args.night,
+        shoe=args.shoe,
+        plate=args.plate,
+        object_name=requested_object,
+        required_roles=required_roles,
+    )
+    plan = choose_preprocess_plan(
+        state,
+        force_preprocess=args.force_preprocess,
+        preprocess_from_step=args.preprocess_from_step,
+    )
+    _print_preprocess_state_summary(state, plan)
+
+    if plan["skip"]:
+        return
+
     infiles_path = write_infiles_from_directory(raw_input_dir, args.preprocess_infiles)
     script_path = os.path.join(os.path.dirname(__file__), "image_processing.py")
-    cmd = [sys.executable, script_path, "--infiles", os.path.abspath(infiles_path)]
+    cmd = [
+        sys.executable,
+        script_path,
+        "--infiles",
+        os.path.abspath(infiles_path),
+        "--start-step",
+        str(plan["start_step"]),
+        "--end-step",
+        "10",
+    ]
 
-    if args.preprocess_object:
-        cmd.extend(["--object", args.preprocess_object])
+    if plan.get("resume_from_proc"):
+        cmd.append("--resume-from-proc")
+        if args.night:
+            cmd.extend(["--night", str(args.night)])
+        if args.shoe:
+            cmd.extend(["--shoe", str(args.shoe)])
+        if args.plate:
+            cmd.extend(["--plate", str(args.plate)])
+
+    if requested_object:
+        cmd.extend(["--object", requested_object])
     if args.preprocess_bias:
         cmd.append("--bias")
     if args.preprocess_flat:
@@ -2540,6 +2872,22 @@ def run_image_preprocessing(args, raw_input_dir):
         raise RuntimeError(
             f"image_processing.py failed with exit code {exc.returncode}"
         ) from exc
+
+    # Validate that required stacked products now exist for requested context.
+    post = discover_inputs(
+        proc_dir,
+        night=args.night,
+        shoe=args.shoe,
+        plate=args.plate,
+        object_name=requested_object,
+        required_roles=required_roles,
+    )
+    missing_after = [role for role in required_roles if role not in post]
+    if missing_after:
+        raise RuntimeError(
+            "Preprocessing finished but required stacked inputs are still missing: "
+            + ", ".join(missing_after)
+        )
 
 
 def prepare_quartz_reference_alias(quartz_path, meta_by_role,
@@ -2819,8 +3167,45 @@ def infer_night_shoe(meta_by_role, reference_path=None, fallback_night=None, fal
     )
 
 
+def infer_plate(meta_by_role, reference_path=None, fallback_plate=None):
+    """Infer PLATE from resolved role metadata with safe fallback."""
+    if meta_by_role:
+        for meta in meta_by_role.values():
+            plate = str(meta.get("PLATE", "")).strip()
+            if plate:
+                return plate
+
+    if reference_path:
+        try:
+            meta = read_required_metadata(reference_path)
+            plate = str(meta.get("PLATE", "")).strip()
+            if plate:
+                return plate
+        except Exception:
+            pass
+
+    return str(fallback_plate or "").strip()
+
+
+def infer_object_token(meta_by_role, fallback_object=None):
+    """Infer safe object token for context-specific helper products."""
+    if "object" in meta_by_role:
+        obj_value = _first_nonblank([
+            _normalize_token_text(meta_by_role["object"].get("OBJECT", "")),
+            meta_by_role["object"].get("OBJECT", ""),
+        ])
+        if obj_value:
+            return _safe_token(obj_value)
+
+    if fallback_object:
+        return _safe_token(_normalize_token_text(fallback_object))
+
+    return "all"
+
+
 def default_affiliation_map_path(meta_by_role, reference_path=None,
-                                 fallback_night=None, fallback_shoe=None):
+                                 fallback_night=None, fallback_shoe=None,
+                                 fallback_plate=None):
     """Return default affiliation-map filename for the current night+shoe."""
     night, shoe = infer_night_shoe(
         meta_by_role,
@@ -2828,11 +3213,18 @@ def default_affiliation_map_path(meta_by_role, reference_path=None,
         fallback_night=fallback_night,
         fallback_shoe=fallback_shoe,
     )
-    return f"affiliation_{night}_{shoe}.json"
+    plate = infer_plate(
+        meta_by_role,
+        reference_path=reference_path,
+        fallback_plate=fallback_plate,
+    )
+    plate_tag = f"_{_safe_token(plate)}" if plate else ""
+    return f"affiliation_{_safe_token(night)}_{_safe_token(shoe)}{plate_tag}.json"
 
 
 def default_geometry_path(meta_by_role, reference_path=None,
-                          fallback_night=None, fallback_shoe=None):
+                          fallback_night=None, fallback_shoe=None,
+                          fallback_plate=None):
     """Return default Step-5 geometry filename for the current night+shoe."""
     night, shoe = infer_night_shoe(
         meta_by_role,
@@ -2840,7 +3232,95 @@ def default_geometry_path(meta_by_role, reference_path=None,
         fallback_night=fallback_night,
         fallback_shoe=fallback_shoe,
     )
-    return f"geometry_{night}_{shoe}.json"
+    plate = infer_plate(
+        meta_by_role,
+        reference_path=reference_path,
+        fallback_plate=fallback_plate,
+    )
+    plate_tag = f"_{_safe_token(plate)}" if plate else ""
+    return f"geometry_{_safe_token(night)}_{_safe_token(shoe)}{plate_tag}.json"
+
+
+def default_extraction_pairs_path(meta_by_role, reference_path=None,
+                                  fallback_night=None, fallback_shoe=None,
+                                  fallback_plate=None, fallback_object=None):
+    """Return default extraction-pairs CSV path for current context."""
+    night, shoe = infer_night_shoe(
+        meta_by_role,
+        reference_path=reference_path,
+        fallback_night=fallback_night,
+        fallback_shoe=fallback_shoe,
+    )
+    plate = infer_plate(
+        meta_by_role,
+        reference_path=reference_path,
+        fallback_plate=fallback_plate,
+    )
+    obj_token = infer_object_token(meta_by_role, fallback_object=fallback_object)
+    plate_tag = f"_{_safe_token(plate)}" if plate else ""
+    return (
+        f"extraction_pairs_{_safe_token(night)}_{_safe_token(shoe)}"
+        f"{plate_tag}_{obj_token}.csv"
+    )
+
+
+def default_reidentify_drift_log_path(meta_by_role, reference_path=None,
+                                      fallback_night=None, fallback_shoe=None,
+                                      fallback_plate=None, fallback_object=None):
+    """Return default drift-log CSV path for current context."""
+    night, shoe = infer_night_shoe(
+        meta_by_role,
+        reference_path=reference_path,
+        fallback_night=fallback_night,
+        fallback_shoe=fallback_shoe,
+    )
+    plate = infer_plate(
+        meta_by_role,
+        reference_path=reference_path,
+        fallback_plate=fallback_plate,
+    )
+    obj_token = infer_object_token(meta_by_role, fallback_object=fallback_object)
+    plate_tag = f"_{_safe_token(plate)}" if plate else ""
+    return (
+        f"reidentify_drift_{_safe_token(night)}_{_safe_token(shoe)}"
+        f"{plate_tag}_{obj_token}.csv"
+    )
+
+
+def candidate_extraction_pair_indices(input_dir, night, shoe, plate=None, object_name=None):
+    """Return candidate extraction-pairs CSV paths (new naming first, legacy last)."""
+    if not night or not shoe:
+        return []
+
+    night_tok = _safe_token(night)
+    shoe_tok = _safe_token(str(shoe).upper())
+    base = f"extraction_pairs_{night_tok}_{shoe_tok}"
+    candidates = []
+
+    if plate:
+        plate_tok = _safe_token(plate)
+        if object_name:
+            candidates.append(f"{base}_{plate_tok}_{_safe_token(_normalize_token_text(object_name))}.csv")
+        candidates.extend(sorted(glob.glob(os.path.join(input_dir, f"{base}_{plate_tok}_*.csv"))))
+
+    if object_name:
+        obj_tok = _safe_token(_normalize_token_text(object_name))
+        candidates.extend(sorted(glob.glob(os.path.join(input_dir, f"{base}_*_{obj_tok}.csv"))))
+
+    candidates.extend(sorted(glob.glob(os.path.join(input_dir, f"{base}_*.csv"))))
+    candidates.extend([
+        os.path.join(input_dir, f"extraction_pairs_{night}_{str(shoe).upper()}.csv"),
+        f"extraction_pairs_{night}_{str(shoe).upper()}.csv",
+    ])
+
+    dedup = []
+    seen = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        dedup.append(candidate)
+    return dedup
 
 
 def _evaluate_iraf_curve(curve_values, ncols):
@@ -3134,6 +3614,8 @@ def save_step5_geometry(path, centers, pattern, quartz_path, meta_by_role):
         "bundle_spacing_parabolas": bundle_spacing_models,
     }
 
+    if os.path.exists(path):
+        print(f"  [overwrite] replacing existing geometry file: {path}")
     with open(path, "w") as fh:
         json.dump(payload, fh, indent=2, sort_keys=True)
     print(f"  Geometry file saved   : {path}")
@@ -3261,6 +3743,8 @@ def save_affiliation_map(path, pattern, quartz_path, meta_by_role):
         "n_apertures": int(len(pattern)),
         "pattern": [int(x) for x in np.asarray(pattern, dtype=int).tolist()],
     }
+    if os.path.exists(path):
+        print(f"  [overwrite] replacing existing affiliation map: {path}")
     with open(path, "w") as fh:
         json.dump(payload, fh, indent=2, sort_keys=True)
     print(f"  Affiliation map saved: {path}")
@@ -3350,6 +3834,8 @@ def write_extraction_pairs_index(path, obj_outputs, thar_outputs, pattern):
     """Write star-to-output pairing summary for object and atlas extractions."""
     pattern = np.asarray(pattern, dtype=int)
     stars = sorted(set(obj_outputs).intersection(set(thar_outputs)))
+    if os.path.exists(path):
+        print(f"  [overwrite] replacing existing extraction index: {path}")
     with open(path, "w", newline="") as fh:
         writer = csv.writer(fh)
         writer.writerow(["star", "object_file", "atlas_file", "apertures"])
@@ -3361,7 +3847,8 @@ def write_extraction_pairs_index(path, obj_outputs, thar_outputs, pattern):
 
 
 def default_star_geometry_path(meta_by_role, reference_path=None,
-                               fallback_night=None, fallback_shoe=None):
+                               fallback_night=None, fallback_shoe=None,
+                               fallback_plate=None, fallback_object=None):
     """Return default star-geometry filename for the current night+shoe."""
     night, shoe = infer_night_shoe(
         meta_by_role,
@@ -3369,7 +3856,17 @@ def default_star_geometry_path(meta_by_role, reference_path=None,
         fallback_night=fallback_night,
         fallback_shoe=fallback_shoe,
     )
-    return f"star_geometry_{night}_{shoe}.json"
+    plate = infer_plate(
+        meta_by_role,
+        reference_path=reference_path,
+        fallback_plate=fallback_plate,
+    )
+    obj_token = infer_object_token(meta_by_role, fallback_object=fallback_object)
+    plate_tag = f"_{_safe_token(plate)}" if plate else ""
+    return (
+        f"star_geometry_{_safe_token(night)}_{_safe_token(shoe)}"
+        f"{plate_tag}_{obj_token}.json"
+    )
 
 
 def save_star_geometry_table(path, pattern, quartz_path, obj_outputs, thar_outputs, meta_by_role):
@@ -3414,6 +3911,8 @@ def save_star_geometry_table(path, pattern, quartz_path, obj_outputs, thar_outpu
         "n_stars": len(records),
         "stars": records,
     }
+    if os.path.exists(path):
+        print(f"  [overwrite] replacing existing star geometry: {path}")
     with open(path, "w") as fh:
         json.dump(payload, fh, indent=2, sort_keys=True)
     print(f"  Star geometry saved  : {path}")
@@ -3518,7 +4017,7 @@ def _read_apertures_from_geometry_file(geometry_path, target_star):
 
 
 def _read_apertures_from_extraction_pairs(extraction_pairs_path, target_star):
-    """Read target star apertures from extraction_pairs_<NIGHT>_<SHOE>.csv."""
+    """Read target star apertures from extraction_pairs context CSV."""
     if not extraction_pairs_path or not os.path.exists(extraction_pairs_path):
         return []
 
@@ -3899,12 +4398,15 @@ def reconstruct_star_outputs_from_disk(args):
     search_dirs = [args.input_dir, os.getcwd()]
     pair_index_candidates = []
     if args.night and args.shoe:
-        shoe = str(args.shoe).upper()
-        pair_name = f"extraction_pairs_{args.night}_{shoe}.csv"
-        pair_index_candidates.extend([
-            pair_name,
-            os.path.join(args.input_dir, pair_name),
-        ])
+        pair_index_candidates.extend(
+            candidate_extraction_pair_indices(
+                args.input_dir,
+                night=args.night,
+                shoe=args.shoe,
+                plate=args.plate,
+                object_name=args.object_name,
+            )
+        )
 
     for pair_index in pair_index_candidates:
         if not os.path.exists(pair_index):
@@ -3978,7 +4480,9 @@ def reconstruct_star_outputs_from_disk(args):
     if not common_stars:
         raise RuntimeError(
             "Could not reconstruct per-star extraction pairs for standalone late-step run. "
-            "Expected extraction_pairs_<NIGHT>_<SHOE>.csv or matching *_starNN_ec*.fits pairs."
+            "Expected extraction_pairs_<NIGHT>_<SHOE>[_<PLATE>]_<OBJECT>.csv "
+            "(or legacy extraction_pairs_<NIGHT>_<SHOE>.csv) "
+            "or matching *_starNN_ec*.fits pairs."
         )
 
     obj_outputs = {s: obj_candidates[s][1] for s in common_stars}
@@ -3989,7 +4493,7 @@ def reconstruct_star_outputs_from_disk(args):
     return obj_outputs, thar_outputs
 
 
-def find_step2_outputs(input_dir, night, shoe):
+def find_step2_outputs(input_dir, night, shoe, plate=None):
     """
     Scan input_dir for step 2 outputs (quartz_sl, thar_sl, obj_sl, twilight_sl)
     or step 4 flat-corrected outputs (*-sl-F.fits).
@@ -4052,7 +4556,11 @@ def find_step2_outputs(input_dir, night, shoe):
                         continue
                     if (shoe is not None and str(match_shoe).upper() != str(shoe).upper()):
                         continue
+                    if plate is not None and str(meta.get("PLATE", "")) != str(plate):
+                        continue
                 except Exception:
+                    if plate is not None:
+                        continue
                     meta = None
 
                 if role_matches_key(key, match, meta):
@@ -4109,15 +4617,23 @@ def main():
     except Exception as exc:
         sys.exit(f"ERROR parsing step range: {exc}")
 
+    if args.preprocess_only and not args.run_preprocess:
+        sys.exit("ERROR: --preprocess-only requires --run-preprocess.")
+    if args.preprocess_from_step is not None and not args.run_preprocess:
+        sys.exit("ERROR: --preprocess-from-step requires --run-preprocess.")
+    if args.force_preprocess and not args.run_preprocess:
+        sys.exit("ERROR: --force-preprocess requires --run-preprocess.")
+
     if args.run_preprocess:
-        if 1 in selected_steps:
-            section_banner("Preprocessing prelude (image_processing.py)")
-            try:
-                run_image_preprocessing(args, raw_input_dir=raw_input_dir)
-            except Exception as exc:
-                sys.exit(f"ERROR preprocessing: {exc}")
-        else:
-            print("  [info] --run-preprocess requested, but start-step > 1; skipping preprocessing.")
+        section_banner("Preprocessing prelude (image_processing.py)")
+        try:
+            run_image_preprocessing(args, raw_input_dir=raw_input_dir, required_roles=required_roles)
+        except Exception as exc:
+            sys.exit(f"ERROR preprocessing: {exc}")
+
+    if args.preprocess_only:
+        print("  Preprocess-only run complete; exiting before echelle steps.")
+        return
 
     try:
         os.chdir(proc_dir)
@@ -4190,7 +4706,8 @@ def main():
         meta = meta_by_role[role]
         print(
             f"    {role:<8} EXPTYPE={meta['EXPTYPE']:<14} "
-            f"OBJECT={meta['OBJECT']:<24} NIGHT={meta['NIGHT']} SHOE={meta['SHOE']}"
+            f"IMAGE_TYPE={meta.get('IMAGE_TYPE', ''):<10} OBJECT={meta['OBJECT']:<24} "
+            f"NIGHT={meta['NIGHT']} SHOE={meta['SHOE']} PLATE={meta.get('PLATE', '')}"
         )
     print("="*72)
 
@@ -4202,7 +4719,14 @@ def main():
         if args.drift_log:
             drift_log_path = args.drift_log
         elif args.night and args.shoe:
-            drift_log_path = f"reidentify_drift_{args.night}_{str(args.shoe).upper()}.csv"
+            drift_log_path = default_reidentify_drift_log_path(
+                meta_by_role,
+                reference_path=quartz_ref or quartz,
+                fallback_night=args.night,
+                fallback_shoe=args.shoe,
+                fallback_plate=args.plate,
+                fallback_object=args.object_name,
+            )
         else:
             drift_log_path = "reidentify_drift.csv"
         if os.path.exists(drift_log_path):
@@ -4274,7 +4798,7 @@ def main():
 
             # If step2_expected is empty but we need step 2 outputs, scan for them
             if not step2_expected and required_step2_keys:
-                step2_expected = find_step2_outputs(args.input_dir, args.night, args.shoe)
+                step2_expected = find_step2_outputs(args.input_dir, args.night, args.shoe, args.plate)
                 if not step2_expected:
                     print(
                         "  [warn] Could not auto-discover step 2 outputs (quartz_sl, etc.).\n"
@@ -4329,22 +4853,28 @@ def main():
         write_output_metadata(thar_ff, {
             "OBJECT": meta_by_role["thar"]["OBJECT"],
             "EXPTYPE": meta_by_role["thar"]["EXPTYPE"],
+            "IMAGE_TYPE": meta_by_role["thar"].get("IMAGE_TYPE", ""),
             "NIGHT": meta_by_role["thar"]["NIGHT"],
             "SHOE": meta_by_role["thar"]["SHOE"],
+            "PLATE": meta_by_role["thar"].get("PLATE", ""),
             "PROCSTEP": "reduce_step4_flatcorr",
         })
         write_output_metadata(obj_ff, {
             "OBJECT": meta_by_role["object"]["OBJECT"],
             "EXPTYPE": meta_by_role["object"]["EXPTYPE"],
+            "IMAGE_TYPE": meta_by_role["object"].get("IMAGE_TYPE", ""),
             "NIGHT": meta_by_role["object"]["NIGHT"],
             "SHOE": meta_by_role["object"]["SHOE"],
+            "PLATE": meta_by_role["object"].get("PLATE", ""),
             "PROCSTEP": "reduce_step4_flatcorr",
         })
         write_output_metadata(twi_ff, {
             "OBJECT": meta_by_role["twilight"]["OBJECT"],
             "EXPTYPE": meta_by_role["twilight"]["EXPTYPE"],
+            "IMAGE_TYPE": meta_by_role["twilight"].get("IMAGE_TYPE", ""),
             "NIGHT": meta_by_role["twilight"]["NIGHT"],
             "SHOE": meta_by_role["twilight"]["SHOE"],
+            "PLATE": meta_by_role["twilight"].get("PLATE", ""),
             "PROCSTEP": "reduce_step4_flatcorr",
         })
     elif 6 in selected_steps:
@@ -4377,12 +4907,14 @@ def main():
             reference_path=preview_quartz,
             fallback_night=args.night,
             fallback_shoe=args.shoe,
+            fallback_plate=args.plate,
         )
         geometry_path = default_geometry_path(
             meta_by_role,
             reference_path=preview_quartz,
             fallback_night=args.night,
             fallback_shoe=args.shoe,
+            fallback_plate=args.plate,
         )
         preview_out = os.path.splitext(map_path)[0] + "_preview_map.txt"
 
@@ -4413,6 +4945,7 @@ def main():
             reference_path=quartz_ref or quartz,
             fallback_night=args.night,
             fallback_shoe=args.shoe,
+            fallback_plate=args.plate,
         )
         if os.path.exists(map_path):
             try:
@@ -4485,7 +5018,14 @@ def main():
                 fallback_night=args.night,
                 fallback_shoe=args.shoe,
             )
-            pair_index = f"extraction_pairs_{night}_{shoe}.csv"
+            pair_index = default_extraction_pairs_path(
+                meta_by_role,
+                reference_path=quartz_ref or quartz,
+                fallback_night=night,
+                fallback_shoe=shoe,
+                fallback_plate=args.plate,
+                fallback_object=obj_meta.get("OBJECT"),
+            )
             write_extraction_pairs_index(pair_index, obj_outputs, thar_outputs, state["pattern"])
 
             star_geometry_path = default_star_geometry_path(
@@ -4493,6 +5033,8 @@ def main():
                 reference_path=quartz_ref or quartz,
                 fallback_night=args.night,
                 fallback_shoe=args.shoe,
+                fallback_plate=args.plate,
+                fallback_object=obj_meta.get("OBJECT"),
             )
             save_star_geometry_table(
                 star_geometry_path,
@@ -4617,16 +5159,27 @@ def main():
                 reference_path=quartz_ref or quartz,
                 fallback_night=args.night,
                 fallback_shoe=args.shoe,
+                fallback_plate=args.plate,
             )
-            candidate_pair_index = f"extraction_pairs_{night_for_step9}_{shoe_for_step9}.csv"
-            if os.path.exists(candidate_pair_index):
-                extraction_pairs_path = candidate_pair_index
+            pair_candidates = candidate_extraction_pair_indices(
+                args.input_dir,
+                night=night_for_step9,
+                shoe=shoe_for_step9,
+                plate=args.plate,
+                object_name=args.object_name,
+            )
+            for candidate_pair_index in pair_candidates:
+                if os.path.exists(candidate_pair_index):
+                    extraction_pairs_path = candidate_pair_index
+                    break
 
             star_geometry_path = default_star_geometry_path(
                 meta_by_role,
                 reference_path=quartz_ref or quartz,
                 fallback_night=args.night,
                 fallback_shoe=args.shoe,
+                fallback_plate=args.plate,
+                fallback_object=args.object_name,
             )
             if os.path.exists(star_geometry_path):
                 try:
