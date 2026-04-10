@@ -84,6 +84,12 @@ import numpy as np
 from astropy.io import fits
 from pyraf import iraf
 
+from file_handler import (
+    load_image_type_overrides,
+    normalize_header_value,
+    save_image_type_overrides,
+)
+
 
 # ---------------------------------------------------------------------------
 # IRAF package loading
@@ -154,6 +160,11 @@ def iraf_spec_token(path):
     return canonical_wavelength_identity(path)
 
 
+def quartz_reference_token(reference_quartz):
+    """Return canonical IRAF apall references token for quartz traces."""
+    return f"./{stem(reference_quartz)}"
+
+
 def write_list(listpath, items):
     with open(listpath, "w") as fh:
         for item in items:
@@ -181,6 +192,15 @@ def resolve_processing_dirs(input_dir):
         raw_dir = abs_input
         proc_dir = os.path.join(raw_dir, 'proc')
     return raw_dir, proc_dir
+
+
+def anchor_proc_workdir(proc_dir):
+    """Anchor process and IRAF working directory to proc_dir."""
+    proc_abs = os.path.abspath(proc_dir)
+    os.makedirs(proc_abs, exist_ok=True)
+    os.chdir(proc_abs)
+    iraf.cd(proc_abs)
+    return proc_abs
 
 
 def read_required_metadata(filepath):
@@ -242,8 +262,9 @@ def is_pipeline_intermediate(path):
     if name.endswith(("-sl.fits", "-f.fits", "_med.fits", "_nflat.fits", "_ff.fits")):
         return True
 
-    # Step 6 extracted outputs.
-    if re.search(r"_star\d+_ec\.fits$", name):
+    # Step 6+ extracted outputs and downstream derivatives.
+    # Matches: *_starNN_ec.fits, *_starNN_ec-crr2.fits, *_starNN_ec-crr2-dc.fits
+    if re.search(r"_star\d+_ec(?:-crr2(?:-dc)?)?\.fits$", name):
         return True
 
     return False
@@ -276,6 +297,408 @@ def classify_role(meta):
     if "object" in text or "science" in text or "sci" in text:
         return "object"
     return None
+
+
+ROLE_TO_IMAGE_TYPE = {
+    "object": "SCIENCE",
+    "quartz": "QUARTZ",
+    "thar": "LAMP",
+    "twilight": "TWILIGHT",
+    "dark": "DARK",
+}
+
+
+def _normalized_signature(exptype_norm, object_norm):
+    return f"exptype={exptype_norm}|object={object_norm}"
+
+
+def _role_from_image_type(image_type):
+    value = str(image_type or "").strip().upper()
+    mapping = {
+        "SCIENCE": "object",
+        "QUARTZ": "quartz",
+        "LAMP": "thar",
+        "TWILIGHT": "twilight",
+        "DARK": "dark",
+        "DARK_MASTER": "dark",
+    }
+    return mapping.get(value)
+
+
+def _candidate_roles_for_meta(meta):
+    roles = set()
+
+    typed = _role_from_image_type(meta.get("IMAGE_TYPE", ""))
+    if typed:
+        roles.add(typed)
+
+    inferred = classify_role(meta)
+    if inferred:
+        roles.add(inferred)
+
+    exptype_norm = str(meta.get("EXPTYPE_NORM", ""))
+    object_norm = str(meta.get("OBJECT_NORM", ""))
+    text = f"{exptype_norm} {object_norm}".strip()
+
+    if "dark" in text:
+        roles.add("dark")
+    if any(token in text for token in ("twilight", "dawn sky")):
+        roles.add("twilight")
+    if any(token in text for token in ("quartz", "flat", "domeflat", "dome flat")):
+        roles.add("quartz")
+    if any(token in text for token in ("thar", "thne", "tharne", "lamp", "arc", "comp")):
+        roles.add("thar")
+    if any(token in text for token in ("object", "science", " sci", "target", "star")):
+        roles.add("object")
+
+    return roles
+
+
+def _is_dark_master_candidate(meta):
+    """Return True when metadata represents a DARK_MASTER product."""
+    image_type = str(meta.get("IMAGE_TYPE", "")).strip().upper()
+    if image_type == "DARK_MASTER":
+        return True
+
+    exptype_norm = str(meta.get("EXPTYPE_NORM", "")).lower()
+    object_norm = str(meta.get("OBJECT_NORM", "")).lower()
+    text = f"{exptype_norm} {object_norm}".strip()
+    return "dark master" in text or "master dark" in text
+
+
+def _candidate_roots(args):
+    roots = []
+    for attr in ("raw_input_dir", "proc_dir", "input_dir"):
+        value = getattr(args, attr, None)
+        if not value:
+            continue
+        abspath = os.path.abspath(value)
+        if os.path.isdir(abspath) and abspath not in roots:
+            roots.append(abspath)
+    return roots
+
+
+def iter_candidate_fits_paths(args):
+    """Yield unique FITS paths from raw/proc run roots."""
+    seen = set()
+    for root in _candidate_roots(args):
+        for dirpath, _dirnames, filenames in os.walk(root):
+            for fname in filenames:
+                if not fname.lower().endswith(".fits"):
+                    continue
+                path = os.path.abspath(os.path.join(dirpath, fname))
+                if path in seen:
+                    continue
+                seen.add(path)
+                yield path
+
+
+def _infer_scope_from_resolved(args, resolved):
+    night = str(args.night) if args.night else None
+    shoe = str(args.shoe).upper() if args.shoe else None
+    plate = str(args.plate) if args.plate else None
+
+    if night and shoe and plate:
+        return night, shoe, plate
+
+    nights = set()
+    shoes = set()
+    plates = set()
+
+    for path in resolved.values():
+        try:
+            meta = read_required_metadata(path)
+        except Exception:
+            continue
+        nights.add(str(meta.get("NIGHT", "")))
+        shoes.add(str(meta.get("SHOE", "")).upper())
+        plate_val = str(meta.get("PLATE", "")).strip()
+        if plate_val:
+            plates.add(plate_val)
+
+    if night is None and len(nights) == 1:
+        night = next(iter(nights))
+    if shoe is None and len(shoes) == 1:
+        shoe = next(iter(shoes))
+    if plate is None and len(plates) == 1:
+        plate = next(iter(plates))
+
+    return night, shoe, plate
+
+
+def collect_header_inventory(args, resolved, required_roles=None):
+    """Collect run-local FITS header combinations for unresolved-role prompts."""
+    required_roles = set(required_roles or ())
+    override_path_arg = getattr(args, "image_type_override_path", None)
+    overrides, override_path = load_image_type_overrides(override_path_arg)
+
+    scope_night, scope_shoe, scope_plate = _infer_scope_from_resolved(args, resolved)
+    candidates = []
+    skipped_missing = 0
+
+    for path in iter_candidate_fits_paths(args):
+        try:
+            hdr = fits.getheader(path)
+        except Exception:
+            continue
+
+        required = ("OBJECT", "EXPTYPE", "NIGHT", "SHOE")
+        if any(k not in hdr for k in required):
+            skipped_missing += 1
+            continue
+
+        exptype_raw = str(hdr.get("EXPTYPE", ""))
+        object_raw = str(hdr.get("OBJECT", ""))
+        night = str(hdr.get("NIGHT", ""))
+        shoe = str(hdr.get("SHOE", "")).upper()
+        plate = str(hdr.get("PLATE", "")).strip()
+
+        exptype_norm = normalize_header_value(exptype_raw)
+        object_norm = normalize_header_value(object_raw)
+        signature = _normalized_signature(exptype_norm, object_norm)
+
+        image_type = str(hdr.get("IMAGE_TYPE", "")).strip().upper()
+        override_image_type = overrides.get(signature)
+        if override_image_type:
+            image_type = override_image_type
+
+        meta = {
+            "path": path,
+            "OBJECT": object_raw,
+            "EXPTYPE": exptype_raw,
+            "IMAGE_TYPE": image_type,
+            "NIGHT": night,
+            "SHOE": shoe,
+            "PLATE": plate,
+            "STACKED": bool(hdr.get("STACKED", False)),
+            "STACKTYPE": str(hdr.get("STACKTYPE", "")),
+            "STACKMOD": str(hdr.get("STACKMOD", "")),
+            "OPAMP": str(hdr.get("OPAMP", "")),
+            "LC-TIME": str(hdr.get("LC-TIME", "")),
+            "FILENAME": str(hdr.get("FILENAME", "")),
+            "EXPTYPE_NORM": exptype_norm,
+            "OBJECT_NORM": object_norm,
+            "SIGNATURE": signature,
+        }
+        meta["CANDIDATE_ROLES"] = _candidate_roles_for_meta(meta)
+
+        # DARK_MASTER fallback is allowed across NIGHT/PLATE; keep those as
+        # informational metadata while still constraining non-dark roles.
+        candidate_roles = meta.get("CANDIDATE_ROLES", set())
+        if scope_night and night != scope_night and "dark" not in candidate_roles:
+            continue
+        if scope_plate and plate != scope_plate and "dark" not in candidate_roles:
+            continue
+
+        candidates.append(meta)
+
+    shoes = sorted({m["SHOE"] for m in candidates if m.get("SHOE")})
+    selected_shoe = scope_shoe
+    if selected_shoe:
+        candidates = [m for m in candidates if m["SHOE"] == selected_shoe]
+    elif len(shoes) == 1:
+        selected_shoe = shoes[0]
+        candidates = [m for m in candidates if m["SHOE"] == selected_shoe]
+
+    grouped = {}
+    for meta in candidates:
+        key = (
+            meta["NIGHT"],
+            meta["SHOE"],
+            meta.get("PLATE", ""),
+            meta["EXPTYPE_NORM"],
+            meta["OBJECT_NORM"],
+        )
+        entry = grouped.get(key)
+        if entry is None:
+            entry = {
+                "night": meta["NIGHT"],
+                "shoe": meta["SHOE"],
+                "plate": meta.get("PLATE", ""),
+                "exptype_norm": meta["EXPTYPE_NORM"],
+                "object_norm": meta["OBJECT_NORM"],
+                "plate_label": meta.get("PLATE", ""),
+                "exptype_label": meta["EXPTYPE"],
+                "object_label": meta["OBJECT"],
+                "signature": meta["SIGNATURE"],
+                "candidates": [],
+                "candidate_roles": set(),
+            }
+            grouped[key] = entry
+        entry["candidates"].append(meta)
+        entry["candidate_roles"].update(meta.get("CANDIDATE_ROLES", set()))
+
+    groups = list(grouped.values())
+    groups.sort(key=lambda g: (g["night"], g["shoe"], g.get("plate", ""), g["exptype_norm"], g["object_norm"]))
+
+    return {
+        "groups": groups,
+        "all_groups": list(grouped.values()),
+        "night": scope_night,
+        "shoe": selected_shoe,
+        "shoe_options": shoes,
+        "plate": scope_plate,
+        "skipped_missing": skipped_missing,
+        "overrides": overrides,
+        "override_path": override_path,
+    }
+
+
+def _format_inventory_label(group):
+    return (
+        f"PLATE={group.get('plate_label', '')} "
+        f"EXPTYPE='{group['exptype_label']}' OBJECT='{group['object_label']}'"
+    )
+
+
+def _format_inventory_combinations(groups):
+    if not groups:
+        return ["  (none discovered)"]
+    lines = []
+    for g in groups:
+        lines.append(
+            "  - NIGHT={night} SHOE={shoe} {label} [n={count}]".format(
+                night=g["night"],
+                shoe=g["shoe"],
+                label=_format_inventory_label(g),
+                count=len(g["candidates"]),
+            )
+        )
+    return lines
+
+
+def _prompt_numbered_menu(question, options, text_aliases=None):
+    print(question)
+    for idx, option in enumerate(options, start=1):
+        print(f"[{idx}] {option}")
+
+    while True:
+        answer = input("Selection (Enter to skip): ").strip()
+        if not answer:
+            return None
+        if text_aliases:
+            alias_index = text_aliases.get(answer.upper())
+            if alias_index is not None:
+                return alias_index
+        try:
+            selected = int(answer)
+        except ValueError:
+            if text_aliases:
+                valid_text = "/".join(sorted(text_aliases.keys()))
+                print(f"Invalid selection. Please enter a menu number or one of: {valid_text}.")
+            else:
+                print("Invalid selection. Please enter a number from the menu.")
+            continue
+        if 1 <= selected <= len(options):
+            return selected - 1
+        if text_aliases:
+            valid_text = "/".join(sorted(text_aliases.keys()))
+            print(f"Invalid selection. Please enter a menu number or one of: {valid_text}.")
+        else:
+            print("Invalid selection. Please enter a number from the menu.")
+
+
+def _prompt_for_missing_roles_from_inventory(args, missing_roles, inventory):
+    interactive = sys.stdin.isatty()
+    groups = list(inventory.get("groups", []))
+    selected = {}
+    updated_overrides = False
+
+    shoe_options = sorted({g["shoe"] for g in groups if g.get("shoe")})
+    chosen_shoe = inventory.get("shoe")
+    if chosen_shoe:
+        groups = [g for g in groups if g["shoe"] == chosen_shoe]
+    elif len(shoe_options) == 1:
+        chosen_shoe = shoe_options[0]
+        groups = [g for g in groups if g["shoe"] == chosen_shoe]
+    elif len(shoe_options) > 1:
+        if not interactive:
+            return selected
+        shoe_aliases = {str(option).upper(): idx for idx, option in enumerate(shoe_options)}
+        idx = _prompt_numbered_menu(
+            "Which SHOE should be used for unresolved role mapping?",
+            shoe_options,
+            text_aliases=shoe_aliases,
+        )
+        if idx is None:
+            return selected
+        chosen_shoe = shoe_options[idx]
+        groups = [g for g in groups if g["shoe"] == chosen_shoe]
+
+    scope_night = inventory.get("night")
+    if scope_night is None:
+        nights = sorted({g["night"] for g in groups if g.get("night")})
+        if len(nights) == 1:
+            scope_night = nights[0]
+
+    role_prompt_names = {
+        "object": "science/object",
+        "quartz": "quartz/flat",
+        "thar": "ThAr/lamp/arc",
+        "twilight": "twilight",
+        "dark": "dark",
+    }
+
+    for role in missing_roles:
+        if role == "dark":
+            predicted = [
+                g for g in groups
+                if any(_is_dark_master_candidate(c) for c in g.get("candidates", []))
+            ]
+            role_groups = list(predicted)
+        else:
+            predicted = [g for g in groups if role in g.get("candidate_roles", set())]
+            role_groups = predicted if predicted else list(groups)
+        if not role_groups:
+            continue
+
+        if interactive:
+            if role == "dark":
+                question = (
+                    "\nWhich of the following is the DARK_MASTER image label for "
+                    f"SHOE={chosen_shoe or '*'}? "
+                    "(NIGHT/PLATE shown for context only)"
+                )
+                menu_options = [
+                    (
+                        f"NIGHT={g.get('night', '')} "
+                        f"SHOE={g.get('shoe', '')} "
+                        f"PLATE={g.get('plate_label', g.get('plate', ''))} "
+                        f"EXPTYPE='{g.get('exptype_label', '')}' "
+                        f"OBJECT='{g.get('object_label', '')}'"
+                    )
+                    for g in role_groups
+                ]
+            else:
+                question = (
+                    f"\nWhich of the following is the {role_prompt_names.get(role, role)} "
+                    "image label for "
+                    f"NIGHT={scope_night or '*'} SHOE={chosen_shoe or '*'} "
+                    f"PLATE={inventory.get('plate') or '*'}:"
+                )
+                menu_options = [_format_inventory_label(g) for g in role_groups]
+            idx = _prompt_numbered_menu(question, menu_options)
+            if idx is None:
+                continue
+            chosen_group = role_groups[idx]
+        elif len(predicted) == 1:
+            chosen_group = predicted[0]
+        else:
+            continue
+
+        selected[role] = chosen_group
+
+        image_type = ROLE_TO_IMAGE_TYPE.get(role)
+        if image_type:
+            signature = chosen_group.get("signature")
+            if signature and inventory["overrides"].get(signature) != image_type:
+                inventory["overrides"][signature] = image_type
+                updated_overrides = True
+
+    if updated_overrides:
+        save_image_type_overrides(inventory["overrides"], inventory["override_path"])
+
+    return selected
 
 
 def processing_rank(meta):
@@ -316,6 +739,30 @@ def processing_rank(meta):
     return score
 
 
+def _format_object_candidate_option(meta):
+    """Build a concise disambiguation label for object candidates."""
+    return (
+        f"{os.path.basename(meta.get('path', ''))} | "
+        f"OBJECT={meta.get('OBJECT', '')} "
+        f"NIGHT={meta.get('NIGHT', '')} "
+        f"SHOE={meta.get('SHOE', '')} "
+        f"PLATE={meta.get('PLATE', '')} "
+        f"IMAGE_TYPE={meta.get('IMAGE_TYPE', '')}"
+    )
+
+
+def _prompt_for_object_candidate(candidates):
+    """Prompt interactively to select one ambiguous object candidate."""
+    options = [_format_object_candidate_option(meta) for meta in candidates]
+    idx = _prompt_numbered_menu(
+        "Multiple processed SCIENCE/object candidates were found. Select one:",
+        options,
+    )
+    if idx is None:
+        return None
+    return candidates[idx]
+
+
 def _select_unique_candidate(role, candidates):
     """Return one candidate per role, preferring stacked products when present."""
     if not candidates:
@@ -343,7 +790,10 @@ def _select_unique_candidate(role, candidates):
 
         # Identical rank and same shoe: still ambiguous, fail
         if len(tied) > 1:
-            pass
+            if role == "object" and sys.stdin.isatty():
+                selected = _prompt_for_object_candidate(tied)
+                if selected is not None:
+                    return selected
 
     msg = [f"Ambiguous candidates for role '{role}':"]
     for c in scored:
@@ -353,15 +803,100 @@ def _select_unique_candidate(role, candidates):
             f"EXPTYPE={c['EXPTYPE']}, OBJECT={c['OBJECT']}, NIGHT={c['NIGHT']}, "
             f"SHOE={c['SHOE']}, PLATE={c.get('PLATE', '')})"
         )
-    msg.append("Please pass an explicit --{role} file.")
-    raise RuntimeError("\n".join(msg).replace("{role}", role))
+    if role == "object":
+        msg.append(
+            "Ambiguity detected in processed SCIENCE/object candidates. "
+            "Select one interactively in a TTY session or pass explicit --object."
+        )
+    else:
+        msg.append(f"Please pass an explicit --{role} file.")
+    raise RuntimeError("\n".join(msg))
+
+
+def _is_raw_amplifier_member(meta):
+    """Return True when candidate path looks like a raw c1/c2/c3/c4 amplifier file."""
+    name = os.path.basename(meta.get("path", "")).lower()
+    return bool(re.match(r"^[br]\d{4}c[1-4]\.fits$", name))
+
+
+def _is_stage_appropriate_reduce_input(meta):
+    """Return True for processed products suitable as reduce_echelle role inputs."""
+    path = meta.get("path", "")
+    name = os.path.basename(path).lower()
+
+    if _is_raw_amplifier_member(meta):
+        return False
+    if is_pipeline_intermediate(path):
+        return False
+    if is_stacked_product(meta):
+        return True
+    if any(tag in name for tag in ("-full", "-mcrr", "-ot")):
+        return True
+    return False
+
+
+def _filter_reduce_stage_candidates(candidates):
+    """Keep only candidates appropriate for reduce_echelle final role resolution."""
+    return [meta for meta in candidates if _is_stage_appropriate_reduce_input(meta)]
+
+
+def _resolve_role_from_inventory_group(role, group):
+    """Resolve a prompted role-group mapping to a final processed file path."""
+    all_candidates = list(group.get("candidates", []))
+
+    if role == "dark":
+        dark_master_candidates = [c for c in all_candidates if _is_dark_master_candidate(c)]
+        if not dark_master_candidates:
+            label = (
+                f"NIGHT={group.get('night', '')} SHOE={group.get('shoe', '')} "
+                f"PLATE={group.get('plate_label', group.get('plate', ''))} "
+                f"EXPTYPE='{group.get('exptype_label', '')}' "
+                f"OBJECT='{group.get('object_label', '')}'"
+            )
+            raise RuntimeError(
+                f"Resolved role '{role}' from selected label:\n"
+                f"  {label}\n"
+                "but no DARK_MASTER candidate was found in this group.\n"
+                "Pass an explicit --dark master-dark FITS path."
+            )
+        selected_meta = _select_unique_candidate(role, dark_master_candidates)
+        return selected_meta["path"] if selected_meta is not None else None
+
+    filtered = _filter_reduce_stage_candidates(all_candidates)
+    if not filtered:
+        label = (
+            f"NIGHT={group.get('night', '')} SHOE={group.get('shoe', '')} "
+            f"PLATE={group.get('plate_label', group.get('plate', ''))} "
+            f"EXPTYPE='{group.get('exptype_label', '')}' "
+            f"OBJECT='{group.get('object_label', '')}'"
+        )
+        raise RuntimeError(
+            f"Resolved role '{role}' from unique header label:\n"
+            f"  {label}\n"
+            "but no stage-appropriate processed product was found.\n"
+            "Only raw/repeated members were found in this group.\n"
+            f"Run image_processing.py first or pass an explicit processed --{role} file."
+        )
+
+    selected_meta = _select_unique_candidate(role, filtered)
+    return selected_meta["path"] if selected_meta is not None else None
+
+
+def _resolve_prompted_roles_from_inventory(selection_by_role):
+    """Resolve prompted role->group selections into role->path results."""
+    resolved = {}
+    for role, group in selection_by_role.items():
+        selected_path = _resolve_role_from_inventory_group(role, group)
+        if selected_path:
+            resolved[role] = selected_path
+    return resolved
 
 
 def discover_inputs(input_dir, night=None, shoe=None, plate=None, object_name=None, required_roles=None):
     """Auto-discover required role files from metadata-rich FITS products."""
     required_roles = set(required_roles or ("quartz", "thar", "object", "twilight"))
     fits_paths = sorted(glob.glob(os.path.join(input_dir, "*.fits")))
-    by_role = {"quartz": [], "thar": [], "object": [], "twilight": []}
+    by_role = {"quartz": [], "thar": [], "object": [], "twilight": [], "dark": []}
     skipped = 0
 
     for path in fits_paths:
@@ -371,8 +906,9 @@ def discover_inputs(input_dir, night=None, shoe=None, plate=None, object_name=No
             skipped += 1
             continue
 
-        # Auto-discovery should only consider final stacked products.
-        if not is_stacked_product(meta):
+        # Auto-discovery should only consider final stacked products, except
+        # DARK_MASTER products that are valid dark-role inputs.
+        if not is_stacked_product(meta) and not _is_dark_master_candidate(meta):
             continue
 
         # Exclude products generated by this script; role discovery should use
@@ -380,19 +916,23 @@ def discover_inputs(input_dir, night=None, shoe=None, plate=None, object_name=No
         if is_pipeline_intermediate(meta["path"]):
             continue
 
-        if night and str(meta["NIGHT"]) != str(night):
+        role = classify_role(meta)
+        if role is None and _is_dark_master_candidate(meta):
+            role = "dark"
+
+        if role != "dark" and night and str(meta["NIGHT"]) != str(night):
             continue
         if shoe and str(meta["SHOE"]).upper() != str(shoe).upper():
             continue
-        if plate and str(meta.get("PLATE", "")) != str(plate):
+        if role != "dark" and plate and str(meta.get("PLATE", "")) != str(plate):
             continue
-
-        role = classify_role(meta)
         if role is None:
             continue
         if object_name and role == "object":
             if object_name.lower() not in meta["OBJECT"].lower():
                 continue
+        if role == "dark" and not _is_dark_master_candidate(meta):
+            continue
         by_role[role].append(meta)
 
     selected = {}
@@ -425,6 +965,16 @@ def discover_inputs(input_dir, night=None, shoe=None, plate=None, object_name=No
         if selected_meta is not None:
             selected[role] = selected_meta["path"]
 
+    if "dark" in required_roles:
+        dark_candidates = list(by_role["dark"])
+        if inferred_shoe is not None:
+            dark_candidates = [
+                c for c in dark_candidates
+                if str(c["SHOE"]).upper() == str(inferred_shoe).upper()
+            ]
+        if len(dark_candidates) == 1:
+            selected["dark"] = dark_candidates[0]["path"]
+
     print(
         f"  Auto-discovery scanned {len(fits_paths)} FITS files; "
         f"{skipped} lacked required metadata keys."
@@ -445,6 +995,7 @@ def resolve_inputs(args, required_roles=None):
         "thar": args.thar,
         "object": args.object,
         "twilight": args.twilight,
+        "dark": getattr(args, "dark", None),
     }
 
     if all(manual[r] for r in required_roles):
@@ -467,11 +1018,60 @@ def resolve_inputs(args, required_roles=None):
             resolved[role] = path
 
     missing = [r for r in required_roles if r not in resolved]
+    inventory = None
     if missing:
-        raise RuntimeError(
+        inventory = collect_header_inventory(args, resolved, required_roles=required_roles)
+        prompted_groups = _prompt_for_missing_roles_from_inventory(args, missing, inventory)
+        prompted = _resolve_prompted_roles_from_inventory(prompted_groups)
+        resolved.update(prompted)
+        missing = [r for r in required_roles if r not in resolved]
+
+    if "dark" in missing and sys.stdin.isatty():
+        manual_dark = input(
+            "No DARK_MASTER was auto-discovered. Enter manual --dark path "
+            "(or press Enter to skip): "
+        ).strip()
+        if manual_dark:
+            if os.path.isfile(manual_dark):
+                resolved["dark"] = manual_dark
+                missing = [r for r in required_roles if r not in resolved]
+            else:
+                print(f"  [warning] Manual dark path does not exist: {manual_dark}")
+
+    if missing:
+        details = [
             "Could not resolve all required inputs. Missing roles: "
-            f"{', '.join(missing)}. Provide explicit flags or refine "
-            "--input-dir/--night/--shoe/--object-name."
+            f"{', '.join(missing)}."
+        ]
+        if inventory is not None:
+            details.append("Discovered unique NIGHT/SHOE/PLATE/EXPTYPE/OBJECT combinations:")
+            details.extend(_format_inventory_combinations(inventory.get("groups", [])))
+            if inventory.get("skipped_missing", 0):
+                details.append(
+                    f"  [info] {inventory['skipped_missing']} FITS files lacked one or more "
+                    "required inventory keys (OBJECT/EXPTYPE/NIGHT/SHOE)."
+                )
+            shoe_options = sorted({g["shoe"] for g in inventory.get("groups", []) if g.get("shoe")})
+            if not inventory.get("shoe") and len(shoe_options) > 1:
+                details.append(
+                    "  [info] Multiple SHOEs discovered in current run context: "
+                    f"{', '.join(shoe_options)}"
+                )
+        if not sys.stdin.isatty():
+            details.append(
+                "Non-interactive mode cannot prompt for unresolved roles. "
+                "Provide explicit flags or rerun in a TTY."
+            )
+        if "dark" in missing:
+            details.append(
+                "For DARK_MASTER selection, NIGHT/PLATE are informational only. "
+                "Provide explicit --dark when auto-discovery is ambiguous or empty."
+            )
+        details.append(
+            "Provide explicit flags or refine --input-dir/--night/--shoe/--object-name."
+        )
+        raise RuntimeError(
+            "\n".join(details)
         )
     return resolved
 
@@ -968,7 +1568,7 @@ def _apall_extract_star(image, reference_quartz, aperture_string,
 
     print(f"      apall  apertures={aperture_string!r}  ->  {out_spec}")
 
-    iraf_reference = f"./{stem(reference_quartz)}"
+    iraf_reference = quartz_reference_token(reference_quartz)
 
     iraf.echelle.apall.unlearn()
     iraf.echelle.apall(
@@ -2394,6 +2994,7 @@ def parse_args():
     p.add_argument("--thar", help="ThAr mosaic FITS (manual override).")
     p.add_argument("--object", help="Science object mosaic FITS (manual override).")
     p.add_argument("--twilight", help="Twilight sky mosaic FITS (manual override).")
+    p.add_argument("--dark", help="Master dark FITS (manual override).")
     p.add_argument("--input-dir", default=".",
                    help="Night directory (raw) or proc directory for auto-discovery (default: .).")
     p.add_argument("--run-preprocess", action="store_true",
@@ -2580,8 +3181,11 @@ def require_existing(path, requirement):
         raise RuntimeError(f"Missing required file for {requirement}: {path}")
 
 
-def write_infiles_from_directory(input_dir, infiles_path=None):
-    """Create an image_processing-style infiles list from raw per-chip FITS files."""
+def write_infiles_from_directory(input_dir, infiles_path=None, night=None, shoe=None, plate=None):
+    """Create an image_processing-style infiles list from raw per-chip FITS files.
+
+    Optional NIGHT/SHOE/PLATE filters are applied from FITS headers when provided.
+    """
     fits_paths = sorted(glob.glob(os.path.join(input_dir, "*.fits")))
     raw_like = [
         path for path in fits_paths
@@ -2589,7 +3193,46 @@ def write_infiles_from_directory(input_dir, infiles_path=None):
     ]
     if raw_like:
         fits_paths = raw_like
+
+    def _is_dark_like(meta):
+        image_type = str(meta.get("IMAGE_TYPE", "")).strip().upper()
+        if image_type in {"DARK", "DARK_MASTER"}:
+            return True
+        exptype = str(meta.get("EXPTYPE", "")).strip().lower().replace("_", " ")
+        return "dark" in exptype
+
+    if any(v is not None for v in (night, shoe, plate)):
+        filtered = []
+        skipped_unreadable = 0
+        for path in fits_paths:
+            try:
+                meta = read_required_metadata(path)
+            except Exception:
+                skipped_unreadable += 1
+                continue
+
+            dark_like = _is_dark_like(meta)
+            if night is not None and (not dark_like) and str(meta.get("NIGHT", "")) != str(night):
+                continue
+            if shoe is not None and str(meta.get("SHOE", "")).upper() != str(shoe).upper():
+                continue
+            if plate is not None and (not dark_like) and str(meta.get("PLATE", "")).strip() != str(plate):
+                continue
+            filtered.append(path)
+
+        fits_paths = filtered
+        if skipped_unreadable:
+            print(
+                "  WARNING: skipped "
+                f"{skipped_unreadable} FITS file(s) while filtering infiles by context."
+            )
+
     if not fits_paths:
+        if any(v is not None for v in (night, shoe, plate)):
+            raise RuntimeError(
+                "No FITS files in input directory matched requested preprocessing context: "
+                f"night={night!r}, shoe={shoe!r}, plate={plate!r}"
+            )
         raise RuntimeError(f"No FITS files found in input directory: {input_dir}")
 
     out_path = infiles_path or os.path.join(input_dir, "infiles")
@@ -2649,12 +3292,15 @@ def inspect_preprocess_state(proc_dir, night=None, shoe=None, plate=None,
         row_image_type = str(meta.get("IMAGE_TYPE", "")).strip().upper()
         row_object = str(meta.get("OBJECT", ""))
 
+        exptype_text = str(meta.get("EXPTYPE", "")).strip().lower().replace("_", " ")
+        dark_like = row_image_type in {"DARK", "DARK_MASTER"} or ("dark" in exptype_text)
+
         context_ok = True
-        if night is not None and row_night != str(night):
+        if night is not None and (not dark_like) and row_night != str(night):
             context_ok = False
         if shoe is not None and row_shoe.upper() != str(shoe).upper():
             context_ok = False
-        if plate is not None and row_plate != str(plate):
+        if plate is not None and (not dark_like) and row_plate != str(plate):
             context_ok = False
         if object_filter and row_role == "object" and object_filter not in row_object.lower():
             context_ok = False
@@ -2835,7 +3481,13 @@ def run_image_preprocessing(args, raw_input_dir, required_roles):
     if plan["skip"]:
         return
 
-    infiles_path = write_infiles_from_directory(raw_input_dir, args.preprocess_infiles)
+    infiles_path = write_infiles_from_directory(
+        raw_input_dir,
+        args.preprocess_infiles,
+        night=args.night,
+        shoe=args.shoe,
+        plate=args.plate,
+    )
     script_path = os.path.join(os.path.dirname(__file__), "image_processing.py")
     cmd = [
         sys.executable,
@@ -2850,15 +3502,18 @@ def run_image_preprocessing(args, raw_input_dir, required_roles):
 
     if plan.get("resume_from_proc"):
         cmd.append("--resume-from-proc")
-        if args.night:
-            cmd.extend(["--night", str(args.night)])
-        if args.shoe:
-            cmd.extend(["--shoe", str(args.shoe)])
-        if args.plate:
-            cmd.extend(["--plate", str(args.plate)])
+
+    if args.night:
+        cmd.extend(["--night", str(args.night)])
+    if args.shoe:
+        cmd.extend(["--shoe", str(args.shoe)])
+    if args.plate:
+        cmd.extend(["--plate", str(args.plate)])
 
     if requested_object:
         cmd.extend(["--object", requested_object])
+    if args.dark:
+        cmd.extend(["--dark", str(args.dark)])
     if args.preprocess_bias:
         cmd.append("--bias")
     if args.preprocess_flat:
@@ -3121,15 +3776,59 @@ def quartz_trace_db_candidates(quartz):
     from pathlib import Path
     if quartz is None:
         return []  # No candidates if no quartz provided
-    base = stem(quartz)
+
+    quartz_text = str(quartz).strip().split("[", 1)[0]
+    base = stem(quartz_text)
     db_dir = Path("database")
+
     candidates = [
         str(db_dir / f"ap._{base}"),  # Primary: IRAF's standard convention
         str(db_dir / f"ap.{base}"),   # Alternative without underscore
         str(db_dir / f"ap{base}"),    # Alternative without dot
         base + ".db",                 # Legacy fallback
     ]
-    return candidates
+
+    # IRAF can encode full absolute input paths into ap* DB filenames.
+    # Example: /home/user/proc/quartz.fits -> database/ap_home_user_proc_quartz
+    raw_tokens = []
+    for probe in (quartz_text, os.path.abspath(quartz_text)):
+        if not probe:
+            continue
+        root = os.path.splitext(probe)[0]
+        token = root.replace("\\", "_").replace("/", "_")
+        if token:
+            raw_tokens.append(token)
+
+    for token in raw_tokens:
+        candidates.append(str(db_dir / f"ap{token}"))
+
+    unique = []
+    seen = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        unique.append(candidate)
+    return unique
+
+
+def debug_quartz_trace_db_state(quartz, context, alias_result=None):
+    """Emit concise quartz DB diagnostics for dependency checks."""
+    if quartz is None:
+        print(f"[quartz-db:{context}] quartz=<none>")
+        return
+
+    expected = quartz_reference_token(quartz)
+    candidates = quartz_trace_db_candidates(quartz)
+    existing = [p for p in candidates if os.path.exists(p)]
+    print(
+        f"[quartz-db:{context}] quartz={quartz} expected_token={expected} "
+        f"alias_db={alias_result if alias_result else '<none>'}"
+    )
+    if existing:
+        print(f"[quartz-db:{context}] db_candidates_found={', '.join(existing)}")
+    else:
+        print(f"[quartz-db:{context}] db_candidates_missing={', '.join(candidates)}")
 
 
 def require_quartz_trace_db(quartz, requirement):
@@ -3139,11 +3838,31 @@ def require_quartz_trace_db(quartz, requirement):
             f"Missing quartz reference file for {requirement}. "
             "Provide --quartz <quartz_file> or run steps 1-4 first."
         )
+
+    # Normalize DB identity for the exact reference token used by later apall calls.
+    try:
+        ensure_quartz_trace_db_alias(quartz, quartz)
+    except Exception:
+        # Keep dependency checks robust even if normalization cannot run yet.
+        pass
+
     candidates = quartz_trace_db_candidates(quartz)
-    if any(os.path.exists(p) for p in candidates):
+    existing = [p for p in candidates if os.path.exists(p)]
+    if existing:
+        print(
+            f"[quartz-db:{requirement}] dependency-ok token={quartz_reference_token(quartz)} "
+            f"db={', '.join(existing)}"
+        )
         return
+
+    print(
+        f"[quartz-db:{requirement}] dependency-missing token={quartz_reference_token(quartz)} "
+        f"candidates={', '.join(candidates)}"
+    )
+    iraf_ref = quartz_reference_token(quartz)
     raise RuntimeError(
         f"Missing quartz aperture trace database for {requirement}. "
+        f"Expected IRAF reference token: {iraf_ref}. "
         f"Looked for: {', '.join(candidates)}. "
         "Run step 1 first for this quartz reference."
     )
@@ -4380,6 +5099,15 @@ def _resolve_existing_path(path_value, search_dirs):
     return path_value
 
 
+def _absolute_from_launch(path_value, launch_cwd):
+    """Resolve possibly-relative path against launch cwd into an absolute path."""
+    if not path_value:
+        return path_value
+    if os.path.isabs(path_value):
+        return path_value
+    return os.path.abspath(os.path.join(launch_cwd, path_value))
+
+
 def _prefer_crr2(path):
     """Prefer the CR-cleaned counterpart when available."""
     if not path:
@@ -4577,14 +5305,18 @@ def main():
     launch_cwd = os.getcwd()
 
     raw_input_dir, proc_dir = resolve_processing_dirs(args.input_dir)
-    os.makedirs(proc_dir, exist_ok=True)
+    raw_input_dir = os.path.abspath(raw_input_dir)
+    try:
+        proc_dir = anchor_proc_workdir(proc_dir)
+    except Exception as exc:
+        sys.exit(f"ERROR anchoring working directory to proc: {exc}")
 
     # Processed products are discovered and generated in proc.
     args.raw_input_dir = raw_input_dir
     args.proc_dir = proc_dir
     args.input_dir = proc_dir
 
-    # Resolve relative path-like arguments before changing directories.
+    # Resolve path-like arguments to absolute paths.
     search_dirs = [launch_cwd, raw_input_dir, proc_dir]
     for attr in [
         'quartz',
@@ -4592,6 +5324,7 @@ def main():
         'thar',
         'object',
         'twilight',
+        'dark',
         'step8_reference_thar',
         'preprocess_infiles',
         'preprocess_flat',
@@ -4599,7 +5332,8 @@ def main():
     ]:
         value = getattr(args, attr, None)
         if value:
-            setattr(args, attr, _resolve_existing_path(value, search_dirs))
+            resolved_value = _resolve_existing_path(value, search_dirs)
+            setattr(args, attr, _absolute_from_launch(resolved_value, launch_cwd))
 
     print(f"Raw input directory : {raw_input_dir}")
     print(f"Processing directory: {proc_dir}")
@@ -4636,17 +5370,15 @@ def main():
         return
 
     try:
-        os.chdir(proc_dir)
-    except Exception as exc:
-        sys.exit(f"ERROR changing directory to proc: {exc}")
-
-    try:
         resolved = resolve_inputs(args, required_roles=required_roles)
     except Exception as exc:
         sys.exit(f"ERROR resolving inputs: {exc}")
 
     resolved = {
-        role: _resolve_existing_path(path, [launch_cwd, raw_input_dir, proc_dir])
+        role: _absolute_from_launch(
+            _resolve_existing_path(path, [launch_cwd, raw_input_dir, proc_dir]),
+            launch_cwd,
+        )
         for role, path in resolved.items()
     }
 
@@ -4712,6 +5444,10 @@ def main():
     print("="*72)
 
     load_packages()
+    try:
+        iraf.cd(proc_dir)
+    except Exception as exc:
+        sys.exit(f"ERROR anchoring IRAF directory to proc: {exc}")
     iraf.echelle.dispaxis = args.dispaxis
 
     drift_log_path = None
@@ -4746,11 +5482,18 @@ def main():
             quartz,
             n_ap    = n_ap,
         )
-        if quartz_ref:
-            ensure_quartz_trace_db_alias(quartz, quartz_ref)
+        # Always normalize traced quartz DB identity to its own canonical token.
+        step1_alias = ensure_quartz_trace_db_alias(quartz, quartz)
+        debug_quartz_trace_db_state(quartz, "step1-self", alias_result=step1_alias)
+        # If extraction will use a different reference token, ensure alias DB too.
+        if quartz_ref and os.path.abspath(quartz) != os.path.abspath(quartz_ref):
+            step1_ref_alias = ensure_quartz_trace_db_alias(quartz, quartz_ref)
+            debug_quartz_trace_db_state(quartz_ref, "step1-ref", alias_result=step1_ref_alias)
     elif any(s in selected_steps for s in (2, 6)):
         try:
             if 2 in selected_steps:
+                step2_alias = ensure_quartz_trace_db_alias(quartz, quartz)
+                debug_quartz_trace_db_state(quartz, "step2-precheck", alias_result=step2_alias)
                 require_quartz_trace_db(quartz, "step 2")
             if 6 in selected_steps:
                 if not quartz_ref:
@@ -4758,8 +5501,12 @@ def main():
                         "Step 6 requires a quartz trace reference. Provide --quartz "
                         "or --quartz-reference, or run steps 1-4 first."
                     )
-                if quartz and os.path.abspath(quartz) != os.path.abspath(quartz_ref):
-                    ensure_quartz_trace_db_alias(quartz, quartz_ref)
+                step6_pre_alias = ensure_quartz_trace_db_alias(quartz or quartz_ref, quartz_ref)
+                debug_quartz_trace_db_state(
+                    quartz_ref,
+                    "step6-early-precheck",
+                    alias_result=step6_pre_alias,
+                )
                 require_quartz_trace_db(quartz_ref, "step 6")
         except Exception as exc:
             sys.exit(f"ERROR dependency check: {exc}")
@@ -4896,8 +5643,8 @@ def main():
                 "Provide --quartz or --quartz-reference, or run steps 1-4 first."
             )
         try:
-            if quartz and os.path.abspath(quartz) != os.path.abspath(preview_quartz):
-                ensure_quartz_trace_db_alias(quartz, preview_quartz)
+            step5_alias = ensure_quartz_trace_db_alias(quartz or preview_quartz, preview_quartz)
+            debug_quartz_trace_db_state(preview_quartz, "step5-precheck", alias_result=step5_alias)
             require_quartz_trace_db(preview_quartz, "step 5")
         except Exception as exc:
             sys.exit(f"ERROR dependency check: {exc}")
@@ -4974,6 +5721,8 @@ def main():
     # ── 6. Per-star extraction ────────────────────────────────────────────────
     if 6 in selected_steps:
         try:
+            step6_alias = ensure_quartz_trace_db_alias(quartz or quartz_ref, quartz_ref)
+            debug_quartz_trace_db_state(quartz_ref, "step6-precheck", alias_result=step6_alias)
             require_quartz_trace_db(quartz_ref, "step 6")
             require_existing(state["obj_ff"], "step 6 input object flat-corrected")
             require_existing(state["thar_ff"], "step 6 input thar flat-corrected")

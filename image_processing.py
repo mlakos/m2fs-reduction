@@ -113,7 +113,7 @@ def _grouped_row_indices(table, mask, keys, context):
             if _is_blank(val):
                 bad = True
                 break
-            values.append(str(val))
+            values.append(val)
         if bad:
             skipped_rows += 1
             continue
@@ -132,6 +132,36 @@ def _warn_skip_group(context, message):
     print(f"WARNING [{context}]: {message}")
 
 
+def _is_interactive_stdin():
+    try:
+        return os.isatty(0)
+    except Exception:
+        return False
+
+
+def _resolve_existing_dark_path(path_value):
+    """Return a usable path to an existing dark file, or None."""
+    if _is_blank(path_value):
+        return None
+
+    raw = str(path_value).strip()
+    probes = [
+        raw,
+        os.path.abspath(raw),
+        os.path.join(os.getcwd(), raw),
+        os.path.join(os.getcwd(), os.path.basename(raw)),
+    ]
+
+    seen = set()
+    for probe in probes:
+        if probe in seen:
+            continue
+        seen.add(probe)
+        if os.path.exists(probe):
+            return probe
+    return None
+
+
 def _update_table_filenames(table, mask, filenames, suffix):
     """Update FILENAME and filename_input for selected rows."""
     table['FILENAME'][mask] = [f.replace('.fits', f'-{suffix}') for f in filenames]
@@ -143,9 +173,9 @@ def _write_iraf_lists(listpath, input_frames, output_frames, suffix):
     pre, ext = os.path.splitext(os.path.relpath(listpath))
     outlist_path = f'{pre}-{suffix}{ext}'
     with open(listpath, 'w') as f:
-        f.write('\n'.join(input_frames))
+        f.writelines(f'{frame}\n' for frame in input_frames)
     with open(outlist_path, 'w') as f:
-        f.write('\n'.join(output_frames))
+        f.writelines(f'{frame}\n' for frame in output_frames)
     return outlist_path
 
 
@@ -320,7 +350,7 @@ def build_resume_combined_images(proc_dir, start_step, night=None, shoe=None, pl
     """
     rows = []
     role_rows = {}
-    dark_master_rows = {}
+    dark_master_rows = []
     preferred = _preferred_stages_for_start_step(start_step)
 
     for path in sorted(glob.glob(os.path.join(proc_dir, '*.fits'))):
@@ -334,45 +364,43 @@ def build_resume_combined_images(proc_dir, start_step, night=None, shoe=None, pl
         if any(k not in hdr for k in required):
             continue
 
+        image_type = str(hdr.get('IMAGE_TYPE', '')).strip().upper()
+        exptype = str(hdr.get('EXPTYPE', '')).strip()
         row_night = str(hdr.get('NIGHT', ''))
         row_shoe = str(hdr.get('SHOE', ''))
         row_plate = str(hdr.get('PLATE', '')).strip()
-        if night and row_night != str(night):
+        dark_like = image_type in {'DARK', 'DARK_MASTER'}
+
+        if night and (not dark_like) and row_night != str(night):
             continue
         if shoe and row_shoe.upper() != str(shoe).upper():
             continue
-        if plate is not None and row_plate != str(plate):
+        if plate is not None and (not dark_like) and row_plate != str(plate):
             continue
 
-        image_type = str(hdr.get('IMAGE_TYPE', '')).strip().upper()
-        exptype = str(hdr.get('EXPTYPE', '')).strip()
         object_text = str(hdr.get('OBJECT', '')).strip()
         object_norm = normalize_header_value(object_text)
         exptype_norm = normalize_header_value(exptype)
         stacked_header = bool(hdr.get('STACKED', False))
 
         if image_type == 'DARK_MASTER':
-            dm_key = (row_night, row_shoe, row_plate)
-            existing = dark_master_rows.get(dm_key)
-            if existing is None or os.path.getmtime(path) > existing['mtime']:
-                dark_master_rows[dm_key] = {
-                    'mtime': os.path.getmtime(path),
-                    'row': {
-                        'FILENAME': os.path.splitext(name)[0],
-                        'filename_input': name,
-                        'OBJECT': object_text,
-                        'OBJECT_NORM': object_norm,
-                        'EXPTYPE': exptype,
-                        'EXPTYPE_NORM': exptype_norm,
-                        'IMAGE_TYPE': image_type,
-                        'CLASS_REASON': 'resume_scan_dark_master',
-                        'NIGHT': row_night,
-                        'SHOE': row_shoe,
-                        'PLATE': row_plate,
-                        'STACKED': True,
-                        'STACKTYPE': str(hdr.get('STACKTYPE', '')).strip(),
-                    },
+            dark_master_rows.append(
+                {
+                    'FILENAME': os.path.splitext(name)[0],
+                    'filename_input': name,
+                    'OBJECT': object_text,
+                    'OBJECT_NORM': object_norm,
+                    'EXPTYPE': exptype,
+                    'EXPTYPE_NORM': exptype_norm,
+                    'IMAGE_TYPE': image_type,
+                    'CLASS_REASON': 'resume_scan_dark_master',
+                    'NIGHT': row_night,
+                    'SHOE': row_shoe,
+                    'PLATE': row_plate,
+                    'STACKED': True,
+                    'STACKTYPE': str(hdr.get('STACKTYPE', '')).strip(),
                 }
+            )
             continue
 
         # Resume inputs are mosaic-like non-stacked frames.
@@ -425,8 +453,7 @@ def build_resume_combined_images(proc_dir, start_step, night=None, shoe=None, pl
             selected = newest[0]['row']
         rows.append(selected)
 
-    for item in dark_master_rows.values():
-        rows.append(item['row'])
+    rows.extend(dark_master_rows)
 
     if not rows:
         return Table(rows=[])
@@ -514,16 +541,15 @@ def do_flatfield_correction(intable, listpath, mask, flatpath, suffix='f'):
 
 
 def stack_dark_frames(comb_img_table, method='median'):
-    """Stack dark frames per night and shoe; append DARK_MASTER rows."""
-    if not _require_columns(comb_img_table, ['IMAGE_TYPE', 'NIGHT', 'SHOE'], 'stack_dark_frames'):
+    """Stack dark frames per shoe+plate; append DARK_MASTER rows.
+
+    Darks are treated as reusable across nights for a given shoe+plate.
+    """
+    if not _require_columns(comb_img_table, ['IMAGE_TYPE', 'NIGHT', 'SHOE', 'PLATE'], 'stack_dark_frames'):
         return comb_img_table
 
     darkmask = comb_img_table['IMAGE_TYPE'] == 'DARK'
-    group_keys = _group_keys_with_optional_plate(
-        comb_img_table,
-        ['NIGHT', 'SHOE'],
-        mask=darkmask,
-    )
+    group_keys = ['SHOE', 'PLATE']
     groups = _grouped_row_indices(
         comb_img_table,
         darkmask,
@@ -535,18 +561,19 @@ def stack_dark_frames(comb_img_table, method='median'):
     new_rows = []
     for key_tuple, indices in groups.items():
         values = dict(zip(group_keys, key_tuple))
-        night = values['NIGHT']
         shoe = values['SHOE']
-        plate_value = values.get('PLATE', '')
+        plate_value = str(values['PLATE']).strip()
+        nights = sorted(set(str(comb_img_table['NIGHT'][i]) for i in indices if not _is_blank(comb_img_table['NIGHT'][i])))
+        night_tag = nights[0] if len(nights) == 1 else 'multi'
         frames = [str(comb_img_table['filename_input'][i]) + '[0]' for i in indices]
         if not frames:
             continue
 
         plate_tag = f'_{_safe_token(plate_value)}' if plate_value else ''
-        outpath = f'{night}-Dark_master-{shoe}{plate_tag}{method_suffix}.fits'
-        stack_listpath = f'dark_stack_{night}_{shoe}{plate_tag}{method_suffix}.list'
+        outpath = f'{night_tag}-Dark_master-{shoe}{plate_tag}{method_suffix}.fits'
+        stack_listpath = f'dark_stack_{night_tag}_{shoe}{plate_tag}{method_suffix}.list'
         with open(stack_listpath, 'w') as f:
-            f.write('\n'.join(frames))
+            f.writelines(f'{frame}\n' for frame in frames)
 
         _replace_existing_output(outpath, context='step6_dark_stack output')
         pyraf_utils.stack_science_images(stack_listpath, outpath, mode=method)
@@ -556,7 +583,7 @@ def stack_dark_frames(comb_img_table, method='median'):
                 'OBJECT': str(comb_img_table['OBJECT'][indices[0]]),
                 'EXPTYPE': 'Dark_master',
                 'IMAGE_TYPE': 'DARK_MASTER',
-                'NIGHT': str(night),
+                'NIGHT': str(night_tag),
                 'SHOE': str(shoe),
                 'PLATE': str(plate_value),
                 'STACKED': True,
@@ -566,7 +593,8 @@ def stack_dark_frames(comb_img_table, method='median'):
             context='stack_dark_frames',
             overwrite_conflicts=True,
         )
-        print(f'Night {night}, shoe {shoe} done. Saved in {outpath}')
+        night_label = nights[0] if len(nights) == 1 else ','.join(nights)
+        print(f'Nights {night_label}, shoe {shoe}, plate {plate_value} done. Saved in {outpath}')
 
         template = comb_img_table[indices[0]]
         row = {c: template[c] for c in comb_img_table.colnames}
@@ -602,6 +630,8 @@ def subtract_dark_mask(intable, mask, master_dark_path, label='science'):
     listpath = f'darksub_{label}.list'
     inlist, outlist = table_to_list(subset, listpath, suffix=suffix)
 
+    # Resume runs may start after earlier IRAF package init points.
+    pyraf_utils.load_ccdred()
     pyraf_utils.run_ccdproc_subtract_dark(inlist, outlist, dark_image=master_dark_path)
 
     outtable = intable.copy()
@@ -678,7 +708,7 @@ def science_frame_stacking(comb_img_table, sci_mask, mode, scale='none', image_t
         stack_base = '_'.join(stack_parts)
         stack_listpath = f'stack_{stack_base}.list'
         with open(stack_listpath, 'w') as f:
-            f.write('\n'.join(p.replace('.fits', '.fits[0]') for p in paths))
+            f.writelines(f"{p.replace('.fits', '.fits[0]')}\n" for p in paths)
 
         if image_type_label == 'SCIENCE':
             science_parts = [
@@ -784,9 +814,9 @@ def _make_step2_lists(master_list_path, raw_dir, suffix='ot'):
     outlist = f'{pre}-{suffix}{ext}'
 
     with open(inlist_raw, 'w') as fh:
-        fh.write('\n'.join(raw_inputs))
+        fh.writelines(f'{frame}\n' for frame in raw_inputs)
     with open(outlist, 'w') as fh:
-        fh.write('\n'.join(outputs))
+        fh.writelines(f'{frame}\n' for frame in outputs)
 
     return inlist_raw, outlist
 
@@ -916,11 +946,9 @@ def step5_mosaic(images_table):
         return Table(rows=[])
 
     source_mask = ~np.isin(images_table['IMAGE_TYPE'], ['BIAS', 'MASTER_BIAS'])
-    group_keys = _group_keys_with_optional_plate(
-        images_table,
-        ['NIGHT', 'LC-TIME', 'SHOE'],
-        mask=source_mask,
-    )
+    # Group one exposure strictly by NIGHT/LC-TIME/SHOE.
+    # PLATE may be blank on individual chips and must not split/drop OPAMP sets.
+    group_keys = ['NIGHT', 'LC-TIME', 'SHOE']
     groups = _grouped_row_indices(
         images_table,
         source_mask,
@@ -1039,9 +1067,9 @@ def step6_dark_crr_stack(combined_images):
     return combined_images
 
 
-def step7_dark_subtract(combined_images, object_name=None):
+def step7_dark_subtract(combined_images, object_name=None, dark_override=None):
     _log_step(7, 'Dark subtraction')
-    if not _require_columns(combined_images, ['IMAGE_TYPE', 'SHOE'], 'step7_dark_subtract'):
+    if not _require_columns(combined_images, ['IMAGE_TYPE', 'NIGHT', 'SHOE', 'PLATE'], 'step7_dark_subtract'):
         return combined_images, np.ones(len(combined_images), dtype=bool)
 
     non_dark_mask = ~np.isin(combined_images['IMAGE_TYPE'], ['DARK', 'DARK_MASTER'])
@@ -1064,27 +1092,144 @@ def step7_dark_subtract(combined_images, object_name=None):
         print('No processable non-dark frames selected for dark subtraction; continuing.')
         return combined_images, non_dark_mask
 
-    group_keys = _group_keys_with_optional_plate(
-        combined_images,
-        ['SHOE'],
-        mask=target_mask,
-    )
+    if not np.any(combined_images['IMAGE_TYPE'] == 'DARK_MASTER'):
+        print('No DARK_MASTER frames available; skipping dark subtraction.')
+        return combined_images, non_dark_mask
+
+    group_keys = ['SHOE', 'PLATE']
+
+    def _same_shoe(val_a, val_b):
+        return str(val_a).strip().upper() == str(val_b).strip().upper()
+
+    def _candidate_records_from_table(shoe_value):
+        rows = []
+        for row in combined_images[combined_images['IMAGE_TYPE'] == 'DARK_MASTER']:
+            if not _same_shoe(row['SHOE'], shoe_value):
+                continue
+            resolved = _resolve_existing_dark_path(row['filename_input'])
+            if resolved is None:
+                continue
+            rows.append(
+                {
+                    'path': resolved,
+                    'night': str(row['NIGHT']).strip(),
+                    'plate': str(row['PLATE']).strip(),
+                    'source': 'table',
+                }
+            )
+        return rows
+
+    def _candidate_records_from_cwd(shoe_value):
+        rows = []
+        for path in sorted(glob.glob(os.path.join(os.getcwd(), '*.fits'))):
+            try:
+                hdr = fits.getheader(path)
+            except Exception:
+                continue
+            if str(hdr.get('IMAGE_TYPE', '')).strip().upper() != 'DARK_MASTER':
+                continue
+            if not _same_shoe(hdr.get('SHOE', ''), shoe_value):
+                continue
+            rows.append(
+                {
+                    'path': path,
+                    'night': str(hdr.get('NIGHT', '')).strip(),
+                    'plate': str(hdr.get('PLATE', '')).strip(),
+                    'source': 'cwd',
+                }
+            )
+        return rows
+
+    def _dedupe_candidates(records):
+        deduped = []
+        seen = set()
+        for rec in records:
+            key = os.path.abspath(rec['path'])
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(rec)
+        return deduped
+
+    def _prompt_candidate_choice(records, shoe_value):
+        print(
+            'INFO [step7_dark_subtract]: multiple same-SHOE DARK_MASTER candidates '
+            f"for SHOE={shoe_value}."
+        )
+        for i, rec in enumerate(records, start=1):
+            print(
+                f"  {i:>2}) NIGHT={rec['night'] or 'na'} "
+                f"PLATE={rec['plate'] or 'na'} FILE={rec['path']}"
+            )
+
+        while True:
+            choice = input(
+                f"Select DARK_MASTER [1-{len(records)}], path, or Enter to skip: "
+            ).strip()
+            if choice == '':
+                return None
+            if choice.isdigit():
+                idx = int(choice)
+                if 1 <= idx <= len(records):
+                    return records[idx - 1]['path']
+            manual = _resolve_existing_dark_path(choice)
+            if manual is not None:
+                return manual
+            print(f"WARNING [step7_dark_subtract]: invalid selection '{choice}'.")
+
+    def _prompt_manual_dark_path(shoe_value):
+        while True:
+            entered = input(
+                f"No DARK_MASTER found for SHOE={shoe_value}. "
+                'Enter path to master dark (or Enter to skip): '
+            ).strip()
+            if entered == '':
+                return None
+            resolved = _resolve_existing_dark_path(entered)
+            if resolved is not None:
+                return resolved
+            print(
+                f"WARNING [step7_dark_subtract]: path does not exist: {entered}"
+            )
 
     def _master_dark_path(group_values):
-        m_mask = (
-            (combined_images['IMAGE_TYPE'] == 'DARK_MASTER') &
-            (combined_images['SHOE'] == group_values['SHOE'])
-        )
-        if 'PLATE' in group_values:
-            m_mask = m_mask & (combined_images['PLATE'] == group_values['PLATE'])
-        candidates = combined_images[m_mask]['filename_input']
-        if len(candidates) != 1:
+        if dark_override:
+            chosen = _resolve_existing_dark_path(dark_override)
+            if chosen is None:
+                _warn_skip_group(
+                    'step7_dark_subtract',
+                    f"--dark path not found: {dark_override}",
+                )
+                return None
+            return chosen
+
+        shoe_value = group_values['SHOE']
+        records = _candidate_records_from_table(shoe_value)
+        records.extend(_candidate_records_from_cwd(shoe_value))
+        records = _dedupe_candidates(records)
+
+        if len(records) == 1:
+            return records[0]['path']
+
+        if len(records) > 1:
+            if _is_interactive_stdin():
+                return _prompt_candidate_choice(records, shoe_value)
             _warn_skip_group(
                 'step7_dark_subtract',
-                f"expected one DARK_MASTER for {group_values}, got {len(candidates)}",
+                'multiple same-SHOE DARK_MASTER candidates found for '
+                f"SHOE={shoe_value}. Provide --dark or rerun interactively.",
             )
             return None
-        return str(candidates[0])
+
+        if _is_interactive_stdin():
+            return _prompt_manual_dark_path(shoe_value)
+
+        _warn_skip_group(
+            'step7_dark_subtract',
+            'expected at least one same-SHOE DARK_MASTER for '
+            f"SHOE={shoe_value}, got 0. Provide --dark or rerun interactively.",
+        )
+        return None
 
     target_groups = _grouped_row_indices(
         combined_images,
@@ -1098,13 +1243,15 @@ def step7_dark_subtract(combined_images, object_name=None):
         master_dark = _master_dark_path(values)
         if master_dark is None:
             continue
-        shoe_mask = np.zeros(len(combined_images), dtype=bool)
-        shoe_mask[indices] = True
+        group_mask = np.zeros(len(combined_images), dtype=bool)
+        group_mask[indices] = True
         combined_images = subtract_dark_mask(
             combined_images,
-            shoe_mask,
+            group_mask,
             master_dark,
-            label=f"{values.get('SHOE')}_{_safe_token(values.get('PLATE', ''))}",
+            label=(
+                f"{values.get('SHOE')}_{_safe_token(values.get('PLATE', ''))}"
+            ),
         )
 
     return combined_images, non_dark_mask
@@ -1232,6 +1379,12 @@ def parse_args():
         help='Path to master flat FITS file; enables step 10.',
     )
     parser.add_argument(
+        '--dark',
+        default=None,
+        metavar='DARKFILE',
+        help='Path to master dark FITS file for step-7 override.',
+    )
+    parser.add_argument(
         '--extra-columns',
         nargs='*',
         default=['EXPTIME', 'OBJECT', 'PLATE'],
@@ -1346,7 +1499,11 @@ def main():
     if 6 in selected_steps:
         combined_images = step6_dark_crr_stack(combined_images)
     if 7 in selected_steps:
-        combined_images, _ = step7_dark_subtract(combined_images, args.object)
+        combined_images, _ = step7_dark_subtract(
+            combined_images,
+            args.object,
+            dark_override=args.dark,
+        )
     if 8 in selected_steps:
         combined_images = step8_crr_science(combined_images)
 

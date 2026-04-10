@@ -32,6 +32,15 @@ USER_CLASS_TO_IMAGE_TYPE = {
     'fibermap': 'FIBERMAP',
 }
 
+PROMPT_IMAGE_TYPE_ROLES = [
+    ('dark', 'DARK', 'dark'),
+    ('science/object', 'SCIENCE', 'science/object'),
+    ('flat', 'QUARTZ', 'flat'),
+    ('lamp/thar/arc', 'LAMP', 'lamp'),
+    ('twilight', 'TWILIGHT', 'twilight'),
+    ('fibermap', 'FIBERMAP', 'fibermap'),
+]
+
 
 def normalize_header_value(value):
     """Normalize a FITS header value for deterministic matching."""
@@ -215,6 +224,109 @@ def _iter_ambiguous_groups(table, overrides, min_count=2):
     return sorted(ambiguous, key=lambda item: (-item['count'], item['signature']))
 
 
+def _iter_unresolved_signatures(table):
+    signatures = []
+    seen = set()
+    for row in table:
+        if str(row['IMAGE_TYPE']) != 'UNKNOWN':
+            continue
+        signature = _normalized_signature(row['EXPTYPE_NORM'], row['OBJECT_NORM'])
+        if signature in seen:
+            continue
+        seen.add(signature)
+        signatures.append(signature)
+    return signatures
+
+
+def _is_unusable_label(text):
+    value = normalize_header_value(text)
+    return value in {'', 'unknown', 'none', 'n/a', 'na'}
+
+
+def _preferred_unresolved_label(row):
+    object_label = str(row.get('OBJECT', '')).strip()
+    if not _is_unusable_label(object_label):
+        return object_label
+    exptype_label = str(row.get('EXPTYPE', '')).strip()
+    if not _is_unusable_label(exptype_label):
+        return exptype_label
+    return str(row.get('OBJECT_NORM', '')).strip() or str(row.get('EXPTYPE_NORM', '')).strip() or 'unknown'
+
+
+def _build_unresolved_label_options(table):
+    options = []
+    by_label = {}
+
+    for row in table:
+        if str(row['IMAGE_TYPE']) != 'UNKNOWN':
+            continue
+
+        signature = _normalized_signature(row['EXPTYPE_NORM'], row['OBJECT_NORM'])
+        label = _preferred_unresolved_label(row)
+        payload = by_label.get(label)
+        if payload is None:
+            payload = {'label': label, 'signatures': []}
+            by_label[label] = payload
+            options.append(payload)
+
+        if signature not in payload['signatures']:
+            payload['signatures'].append(signature)
+
+    return options
+
+
+def _prompt_numbered_label_selection(question, options):
+    print(f"\nWhich of the following is the {question} image label:")
+    for idx, entry in enumerate(options, start=1):
+        print(f"[{idx}] {entry['label']}")
+
+    while True:
+        answer = input('Selection (Enter to skip): ').strip()
+        if not answer:
+            return None
+        try:
+            selected = int(answer)
+        except ValueError:
+            print('Invalid selection. Please enter a number from the menu.')
+            continue
+        if 1 <= selected <= len(options):
+            return options[selected - 1]
+        print('Invalid selection. Please enter a number from the menu.')
+
+
+def _prompt_unresolved_classifications(table, overrides, override_path):
+    assigned_labels = set()
+    updated = False
+
+    for _role, image_type, question in PROMPT_IMAGE_TYPE_ROLES:
+        if 'UNKNOWN' not in {str(v) for v in table['IMAGE_TYPE']}:
+            break
+
+        present_types = {str(v) for v in table['IMAGE_TYPE'] if str(v) != 'UNKNOWN'}
+        if image_type in present_types:
+            continue
+
+        options = [
+            entry for entry in _build_unresolved_label_options(table)
+            if entry['label'] not in assigned_labels
+        ]
+        if not options:
+            break
+
+        chosen = _prompt_numbered_label_selection(question, options)
+        if chosen is None:
+            continue
+
+        for signature in chosen['signatures']:
+            overrides[signature] = image_type
+        assigned_labels.add(chosen['label'])
+        save_image_type_overrides(overrides, override_path)
+        table = _apply_classification_rows(table, overrides)
+        updated = True
+
+    return table, updated
+
+
 def _prompt_ambiguous_classifications(ambiguous_groups):
     prompts = {}
     choices = '/'.join(USER_CLASS_TO_IMAGE_TYPE.keys())
@@ -309,7 +421,7 @@ def construct_table_of_images(
     table_out = _apply_classification_rows(table_out, overrides)
 
     ambiguous_groups = _iter_ambiguous_groups(table_out, overrides)
-    unresolved = [group['signature'] for group in ambiguous_groups]
+    unresolved = _iter_unresolved_signatures(table_out)
 
     if interactive is None:
         interactive = sys.stdin.isatty()
@@ -321,9 +433,6 @@ def construct_table_of_images(
             overrides.update(new_overrides)
             save_image_type_overrides(overrides, resolved_override_path)
             table_out = _apply_classification_rows(table_out, overrides)
-            unresolved = [
-                signature for signature in unresolved if signature not in new_overrides
-            ]
             print(
                 f"Saved {len(new_overrides)} classification override(s) to "
                 f"{resolved_override_path}"
@@ -333,6 +442,17 @@ def construct_table_of_images(
             f"WARNING: {len(ambiguous_groups)} ambiguous recurring subset(s) "
             "left as UNKNOWN in non-interactive mode."
         )
+
+    if interactive and 'UNKNOWN' in {str(v) for v in table_out['IMAGE_TYPE']}:
+        table_out, prompted_updates = _prompt_unresolved_classifications(
+            table_out,
+            overrides,
+            resolved_override_path,
+        )
+        if prompted_updates:
+            print(f"Saved classification override(s) to {resolved_override_path}")
+
+    unresolved = _iter_unresolved_signatures(table_out)
 
     table_out.meta['IMAGE_TYPE_OVERRIDE_PATH'] = resolved_override_path
     table_out.meta['UNRESOLVED_AMBIGUOUS_SIGNATURES'] = unresolved
