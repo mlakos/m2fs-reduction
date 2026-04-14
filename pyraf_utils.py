@@ -49,145 +49,81 @@ def hedit_ccdsec(filename, value='[1:2048,1:2056]'):
     )
 
 
-def run_ccdproc_ovefit_trim(images, output):
-    iraf.ccdred.ccdproc.unlearn()
-    # Use iraf.yes / iraf.no to mirror IRAF boolean semantics explicitly.
-    # (PyRAF can coerce types in many cases, but this is the least ambiguous.)
-    iraf.ccdred.ccdproc(
-        images='@'+images,
-        output='@'+output,
-        ccdtype="",
-        max_cache=0,
-        noproc=iraf.no,
+def _ccdproc_base_params(images, output):
+    """Return baseline IRAF ccdproc parameter set used across wrappers."""
+    return {
+        'images': '@' + images,
+        'output': '@' + output,
+        'ccdtype': "",
+        'max_cache': 0,
+        'noproc': iraf.no,
+        'fixpix': iraf.no,
+        'overscan': iraf.no,
+        'trim': iraf.no,
+        'zerocor': iraf.no,
+        'darkcor': iraf.no,
+        'flatcor': iraf.no,
+        'illumcor': iraf.no,
+        'fringecor': iraf.no,
+        'readcor': iraf.no,
+        'scancor': iraf.no,
+        'readaxis': "line",
+        'fixfile': "",
+        'biassec': "image",
+        'trimsec': "image",
+        'zero': "",
+        'dark': "",
+        'flat': "",
+        'illum': "",
+        'fringe': "",
+        'minreplace': 1,
+        'scantype': "shortscan",
+        'nscan': 1,
+        'interactive': iraf.no,
+        'function': "chebyshev",
+        'order': 3,
+        'sample': "*",
+        'naverage': 1,
+        'niterate': 1,
+        'low_reject': 3,
+        'high_reject': 3,
+        'grow': 0.0,
+        'mode': "ql",
+    }
 
-        fixpix=iraf.no,
+
+def _run_ccdproc(images, output, **overrides):
+    """Run IRAF ccdproc with baseline params overridden by caller."""
+    iraf.ccdred.ccdproc.unlearn()
+    params = _ccdproc_base_params(images, output)
+    params.update(overrides)
+    iraf.ccdred.ccdproc(**params)
+
+
+def run_ccdproc_ovefit_trim(images, output):
+    _run_ccdproc(
+        images,
+        output,
         overscan=iraf.yes,
         trim=iraf.yes,
-        zerocor=iraf.no,
-        darkcor=iraf.no,
-        flatcor=iraf.no,
-        illumcor=iraf.no,
-        fringecor=iraf.no,
-        readcor=iraf.no,
-        scancor=iraf.no,
-
-        readaxis="line",
-        fixfile="",
-        biassec="image",
-        trimsec="image",
-        zero="",
-        dark="",
-        flat="",
-        illum="",
-        fringe="",
-        minreplace=1,
-        scantype="shortscan",
-        nscan=1,
-
-        interactive=iraf.no,
-        function="chebyshev",
-        order=3,
-        sample="*",
-        naverage=1,
-        niterate=1,
-        low_reject=3,
-        high_reject=3,
-        grow=0.0,
-        mode="ql",
     )
+
 
 def run_ccdproc_flat_corr(images, output, flat):
-    iraf.ccdred.ccdproc.unlearn()
-    # Use iraf.yes / iraf.no to mirror IRAF boolean semantics explicitly.
-    # (PyRAF can coerce types in many cases, but this is the least ambiguous.)
-    iraf.ccdred.ccdproc(
-        images='@'+images,
-        output='@'+output,
-        ccdtype="",
-        max_cache=0,
-        noproc=iraf.no,
-
-        fixpix=iraf.no,
-        overscan=iraf.no,
-        trim=iraf.no,
-        zerocor=iraf.no,
-        darkcor=iraf.no,
+    _run_ccdproc(
+        images,
+        output,
         flatcor=iraf.yes,
-        illumcor=iraf.no,
-        fringecor=iraf.no,
-        readcor=iraf.no,
-        scancor=iraf.no,
-
-        readaxis="line",
-        fixfile="",
-        biassec="image",
-        trimsec="image",
-        zero="",
-        dark="",
         flat=flat,
-        illum="",
-        fringe="",
-        minreplace=1,
-        scantype="shortscan",
-        nscan=1,
-
-        interactive=iraf.no,
-        function="chebyshev",
-        order=3,
-        sample="*",
-        naverage=1,
-        niterate=1,
-        low_reject=3,
-        high_reject=3,
-        grow=0.0,
-        mode="ql",
     )
     
+
 def run_ccdproc_subtract_dark(images, output, dark_image):
-    iraf.ccdred.ccdproc.unlearn()
-    # Use iraf.yes / iraf.no to mirror IRAF boolean semantics explicitly.
-    # (PyRAF can coerce types in many cases, but this is the least ambiguous.)
-    iraf.ccdred.ccdproc(
-        images='@'+images,
-        output='@'+output,
-        ccdtype="",
-        max_cache=0,
-        noproc=iraf.no,
-
-        fixpix=iraf.no,
-        overscan=iraf.no,
-        trim=iraf.no,
-        zerocor=iraf.no,
+    _run_ccdproc(
+        images,
+        output,
         darkcor=iraf.yes,
-        flatcor=iraf.no,
-        illumcor=iraf.no,
-        fringecor=iraf.no,
-        readcor=iraf.no,
-        scancor=iraf.no,
-
-        readaxis="line",
-        fixfile="",
-        biassec="image",
-        trimsec="image",
-        zero="",
         dark=dark_image,
-        flat="",
-        illum="",
-        fringe="",
-        minreplace=1,
-        scantype="shortscan",
-        nscan=1,
-
-        interactive=iraf.no,
-        function="chebyshev",
-        order=3,
-        sample="*",
-        naverage=1,
-        niterate=1,
-        low_reject=3,
-        high_reject=3,
-        grow=0.0,
-        mode="ql",
     )
     
 def run_zerocombine_masterbias(image_list_path, out_path):
@@ -219,46 +155,12 @@ def run_zerocombine_masterbias(image_list_path, out_path):
 
 
 def run_ccdproc_bias_corr(images, output, zero_image='zeror4.fits', dark_image='dark.fits'):
-    iraf.ccdred.ccdproc.unlearn()
-    iraf.ccdred.ccdproc(
-        images='@'+images,
-        output='@'+output,
-        ccdtype="",
-        max_cache=0,
-        noproc=iraf.no,
-
-        fixpix=iraf.no,
-        overscan=iraf.no,
-        trim=iraf.no,
+    _run_ccdproc(
+        images,
+        output,
         zerocor=iraf.yes,
-        darkcor=iraf.no,
-        flatcor=iraf.no,
-        illumcor=iraf.no,
-        fringecor=iraf.no,
-        readcor=iraf.no,
-        scancor=iraf.no,
-        readaxis="line",
-        fixfile="",
-        biassec="image",
-        trimsec="image",
         zero=zero_image,
         dark=dark_image,
-        flat="",
-        illum="",
-        fringe="",
-        minreplace=1,
-        scantype="shortscan",
-        nscan=1,
-        interactive=iraf.no,
-        function="chebyshev",
-        order=3,
-        sample="*",
-        naverage=1,
-        niterate=1,
-        low_reject=3,
-        high_reject=3,
-        grow=0.0,
-        mode="ql",
     )
     
 def assemble_mosaic(images, output_name):

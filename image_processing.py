@@ -39,6 +39,7 @@ from file_handler import (
     split_path,
     table_to_list,
 )
+from naming_helper import with_suffix, with_suffix_stem
 import pyraf_utils
 
 
@@ -53,6 +54,21 @@ STACKING_STRATEGY = {
 PIPELINE_STATS = {
     'skipped_groups': 0,
     'unresolved_ambiguous': 0,
+}
+
+STAGE_COL = 'STAGE'
+STAGE_RAW = 'raw'
+STAGE_TRIMMED = 'trimmed'
+STAGE_BIAS_CORRECTED = 'bias_corrected'
+STAGE_MOSAIC = 'mosaic'
+STAGE_DARK_SUBTRACTED = 'dark_subtracted'
+STAGE_CR_CLEANED = 'cr_cleaned'
+STAGE_STACKED = 'stacked'
+STAGE_FLAT_CORRECTED = 'flat_corrected'
+
+_LEGACY_STAGE_ALIASES = {
+    'mcrr': STAGE_CR_CLEANED,
+    'darksub': STAGE_DARK_SUBTRACTED,
 }
 
 
@@ -162,10 +178,67 @@ def _resolve_existing_dark_path(path_value):
     return None
 
 
-def _update_table_filenames(table, mask, filenames, suffix):
+def _normalize_stage(value, default=STAGE_RAW):
+    if value is None:
+        return default
+    text = str(value).strip().lower()
+    if not text:
+        return default
+    return _LEGACY_STAGE_ALIASES.get(text, text)
+
+
+def _stage_array(table, default_stage=STAGE_RAW):
+    if len(table) == 0:
+        return np.array([], dtype='U32')
+
+    if STAGE_COL in table.colnames:
+        return np.array(
+            [_normalize_stage(v, default=default_stage) for v in table[STAGE_COL]],
+            dtype='U32',
+        )
+
+    inferred = []
+    for row in table:
+        image_type = str(row['IMAGE_TYPE']) if 'IMAGE_TYPE' in table.colnames else ''
+        exptype = str(row['EXPTYPE']) if 'EXPTYPE' in table.colnames else ''
+        if 'filename_input' in table.colnames:
+            filename = str(row['filename_input'])
+        elif 'FILENAME' in table.colnames:
+            base = str(row['FILENAME'])
+            filename = base if base.lower().endswith('.fits') else f'{base}.fits'
+        else:
+            filename = ''
+        stacked_header = bool(row['STACKED']) if 'STACKED' in table.colnames else False
+
+        if _is_stacked_row(image_type, exptype, filename, stacked_header=stacked_header):
+            inferred.append(STAGE_STACKED)
+            continue
+
+        inferred_stage = _variant_stage_from_name(filename)
+        inferred.append(inferred_stage if inferred_stage is not None else default_stage)
+
+    return np.array([_normalize_stage(v, default=default_stage) for v in inferred], dtype='U32')
+
+
+def _ensure_stage_column(table, default_stage=STAGE_RAW):
+    table[STAGE_COL] = _stage_array(table, default_stage=default_stage)
+    return table
+
+
+def _stage_mask(table, allowed_stages, default_stage=STAGE_RAW):
+    stages = _stage_array(table, default_stage=default_stage)
+    allowed = {_normalize_stage(stage, default='') for stage in allowed_stages}
+    return np.isin(stages, list(allowed))
+
+
+def _update_table_filenames(table, mask, filenames, suffix, stage=None):
     """Update FILENAME and filename_input for selected rows."""
-    table['FILENAME'][mask] = [f.replace('.fits', f'-{suffix}') for f in filenames]
-    table['filename_input'][mask] = [f.replace('.fits', f'-{suffix}.fits') for f in filenames]
+    affix = f'-{suffix}'
+    table['FILENAME'][mask] = [with_suffix_stem(f, affix) for f in filenames]
+    table['filename_input'][mask] = [with_suffix(f, affix) for f in filenames]
+    if stage is not None:
+        _ensure_stage_column(table)
+        table[STAGE_COL][mask] = _normalize_stage(stage)
 
 
 def _write_iraf_lists(listpath, input_frames, output_frames, suffix):
@@ -317,11 +390,17 @@ def _variant_stage_from_name(filename):
     """Classify preprocessing level for a mosaic-like filename."""
     name = os.path.basename(str(filename)).lower()
     if name.endswith('-mcrr.fits'):
-        return 'mcrr'
+        return STAGE_CR_CLEANED
     if name.endswith('-d.fits'):
-        return 'darksub'
+        return STAGE_DARK_SUBTRACTED
+    if name.endswith('-f.fits'):
+        return STAGE_FLAT_CORRECTED
+    if name.endswith('-b.fits'):
+        return STAGE_BIAS_CORRECTED
+    if name.endswith('-ot.fits'):
+        return STAGE_TRIMMED
     if '-full' in name and name.endswith('.fits'):
-        return 'mosaic'
+        return STAGE_MOSAIC
     return None
 
 
@@ -330,16 +409,17 @@ def _base_variant_token(filename):
     root = os.path.splitext(os.path.basename(str(filename)))[0]
     root = re.sub(r'(?i)-mcrr$', '', root)
     root = re.sub(r'(?i)-d$', '', root)
+    root = re.sub(r'(?i)-f$', '', root)
     return root
 
 
 def _preferred_stages_for_start_step(start_step):
     """Return preferred variant stage order for resume runs."""
     if start_step >= 9:
-        return ['mcrr', 'darksub', 'mosaic']
+        return [STAGE_CR_CLEANED, STAGE_DARK_SUBTRACTED, STAGE_MOSAIC]
     if start_step == 8:
-        return ['darksub', 'mosaic', 'mcrr']
-    return ['mosaic', 'darksub', 'mcrr']
+        return [STAGE_DARK_SUBTRACTED, STAGE_MOSAIC, STAGE_CR_CLEANED]
+    return [STAGE_MOSAIC, STAGE_DARK_SUBTRACTED, STAGE_CR_CLEANED]
 
 
 def build_resume_combined_images(proc_dir, start_step, night=None, shoe=None, plate=None, object_name=None):
@@ -377,11 +457,14 @@ def build_resume_combined_images(proc_dir, start_step, night=None, shoe=None, pl
             continue
         if plate is not None and (not dark_like) and row_plate != str(plate):
             continue
+        if image_type == 'DARK_MASTER' and plate is not None and row_plate != str(plate):
+            continue
 
         object_text = str(hdr.get('OBJECT', '')).strip()
         object_norm = normalize_header_value(object_text)
         exptype_norm = normalize_header_value(exptype)
         stacked_header = bool(hdr.get('STACKED', False))
+        header_stage = _normalize_stage(hdr.get(STAGE_COL), default='')
 
         if image_type == 'DARK_MASTER':
             dark_master_rows.append(
@@ -398,15 +481,17 @@ def build_resume_combined_images(proc_dir, start_step, night=None, shoe=None, pl
                     'SHOE': row_shoe,
                     'PLATE': row_plate,
                     'STACKED': True,
-                    'STACKTYPE': str(hdr.get('STACKTYPE', '')).strip(),
+                    'STACKTYP': str(hdr.get('STACKTYP', hdr.get('STACKTYPE', ''))).strip(),
+                    STAGE_COL: _normalize_stage(header_stage, default=STAGE_STACKED),
                 }
             )
             continue
 
         # Resume inputs are mosaic-like non-stacked frames.
-        stage = _variant_stage_from_name(name)
+        stage = header_stage or _variant_stage_from_name(name)
         if stage is None:
             continue
+        stage = _normalize_stage(stage, default=STAGE_MOSAIC)
         if _is_stacked_row(image_type, exptype, name, stacked_header=stacked_header):
             continue
 
@@ -437,7 +522,8 @@ def build_resume_combined_images(proc_dir, start_step, night=None, shoe=None, pl
                 'SHOE': row_shoe,
                 'PLATE': row_plate,
                 'STACKED': False,
-                'STACKTYPE': str(hdr.get('STACKTYPE', '')).strip(),
+                'STACKTYP': str(hdr.get('STACKTYP', hdr.get('STACKTYPE', ''))).strip(),
+                STAGE_COL: stage,
             },
         }
 
@@ -453,6 +539,20 @@ def build_resume_combined_images(proc_dir, start_step, night=None, shoe=None, pl
             selected = newest[0]['row']
         rows.append(selected)
 
+    if dark_master_rows:
+        deduped_dark_masters = []
+        seen_dark_keys = set()
+        for dark_row in dark_master_rows:
+            key = (
+                str(dark_row.get('SHOE', '')).strip().upper(),
+                str(dark_row.get('PLATE', '')).strip(),
+            )
+            if key in seen_dark_keys:
+                continue
+            seen_dark_keys.add(key)
+            deduped_dark_masters.append(dark_row)
+        dark_master_rows = deduped_dark_masters
+
     rows.extend(dark_master_rows)
 
     if not rows:
@@ -461,8 +561,9 @@ def build_resume_combined_images(proc_dir, start_step, night=None, shoe=None, pl
     combined = Table(rows=rows)
     _ensure_string_columns(
         combined,
-        ['FILENAME', 'filename_input', 'OBJECT', 'OBJECT_NORM', 'EXPTYPE', 'EXPTYPE_NORM', 'IMAGE_TYPE', 'CLASS_REASON', 'NIGHT', 'SHOE', 'PLATE', 'STACKTYPE'],
+        ['FILENAME', 'filename_input', 'OBJECT', 'OBJECT_NORM', 'EXPTYPE', 'EXPTYPE_NORM', 'IMAGE_TYPE', 'CLASS_REASON', 'NIGHT', 'SHOE', 'PLATE', 'STACKTYP', STAGE_COL],
     )
+    _ensure_stage_column(combined, default_stage=STAGE_MOSAIC)
     return combined
 
 
@@ -480,7 +581,7 @@ def selected_steps_from_args(args):
 # Processing functions
 # ---------------------------------------------------------------------------
 
-def do_median_crr(intable, listpath, mask, suffix='mcrr'):
+def do_median_crr(intable, listpath, mask, suffix='mcrr', stage=STAGE_CR_CLEANED):
     """Run IRAF crmedian on the rows selected by mask.
 
     Returns (updated_table, outlist_path).
@@ -494,7 +595,7 @@ def do_median_crr(intable, listpath, mask, suffix='mcrr'):
 
     filenames = [str(p) + '.fits' for p in intable[mask]['FILENAME']]
     input_frames = [f.replace('.fits', '.fits[0]') for f in filenames]
-    output_frames = [f.replace('.fits', f'-{suffix}.fits') for f in filenames]
+    output_frames = [with_suffix(f, f'-{suffix}') for f in filenames]
 
     outlist_path = _write_iraf_lists(listpath, input_frames, output_frames, suffix)
 
@@ -505,12 +606,13 @@ def do_median_crr(intable, listpath, mask, suffix='mcrr'):
     print(f'done\n{listpath} -> {outlist_path}')
 
     outtable = intable.copy()
-    _update_table_filenames(outtable, mask, filenames, suffix)
+    _update_table_filenames(outtable, mask, filenames, suffix, stage=stage)
     _ensure_string_columns(outtable, ['FILENAME', 'filename_input'])
+    _ensure_stage_column(outtable)
     return outtable, outlist_path
 
 
-def do_flatfield_correction(intable, listpath, mask, flatpath, suffix='f'):
+def do_flatfield_correction(intable, listpath, mask, flatpath, suffix='f', stage=STAGE_FLAT_CORRECTED):
     """Apply flat-field correction via IRAF ccdproc.
 
     Returns (updated_table, outlist_path).
@@ -524,7 +626,7 @@ def do_flatfield_correction(intable, listpath, mask, flatpath, suffix='f'):
 
     filenames = [str(p) + '.fits' for p in intable[mask]['FILENAME']]
     input_frames = [f.replace('.fits', '.fits[0]') for f in filenames]
-    output_frames = [f.replace('.fits', f'-{suffix}.fits') for f in filenames]
+    output_frames = [with_suffix(f, f'-{suffix}') for f in filenames]
 
     outlist_path = _write_iraf_lists(listpath, input_frames, output_frames, suffix)
 
@@ -535,8 +637,9 @@ def do_flatfield_correction(intable, listpath, mask, flatpath, suffix='f'):
     print(f'done\n{listpath} -> {outlist_path}')
 
     outtable = intable.copy()
-    _update_table_filenames(outtable, mask, filenames, suffix)
+    _update_table_filenames(outtable, mask, filenames, suffix, stage=stage)
     _ensure_string_columns(outtable, ['FILENAME', 'filename_input'])
+    _ensure_stage_column(outtable)
     return outtable, outlist_path
 
 
@@ -587,8 +690,9 @@ def stack_dark_frames(comb_img_table, method='median'):
                 'SHOE': str(shoe),
                 'PLATE': str(plate_value),
                 'STACKED': True,
-                'STACKTYPE': str(method).lower(),
+                'STACKTYP': str(method).lower(),
                 'PROCSTEP': 'step6_dark_stack',
+                STAGE_COL: STAGE_STACKED,
             },
             context='stack_dark_frames',
             overwrite_conflicts=True,
@@ -607,7 +711,8 @@ def stack_dark_frames(comb_img_table, method='median'):
         if 'PLATE' in row:
             row['PLATE'] = str(plate_value)
         row['STACKED'] = True
-        row['STACKTYPE'] = str(method).lower()
+        row['STACKTYP'] = str(method).lower()
+        row[STAGE_COL] = STAGE_STACKED
         new_rows.append(row)
 
     if not new_rows:
@@ -616,6 +721,7 @@ def stack_dark_frames(comb_img_table, method='median'):
 
     result = vstack([comb_img_table, Table(new_rows)])
     _ensure_string_columns(result, ['FILENAME', 'filename_input'])
+    _ensure_stage_column(result)
     return result
 
 
@@ -636,8 +742,9 @@ def subtract_dark_mask(intable, mask, master_dark_path, label='science'):
 
     outtable = intable.copy()
     filenames = [str(p) + '.fits' for p in subset['FILENAME']]
-    _update_table_filenames(outtable, mask, filenames, suffix)
+    _update_table_filenames(outtable, mask, filenames, suffix, stage=STAGE_DARK_SUBTRACTED)
     _ensure_string_columns(outtable, ['FILENAME', 'filename_input'])
+    _ensure_stage_column(outtable)
     return outtable
 
 
@@ -738,9 +845,10 @@ def science_frame_stacking(comb_img_table, sci_mask, mode, scale='none', image_t
             'SHOE': str(shoe),
             'PLATE': str(plate_value),
             'STACKED': True,
-            'STACKTYPE': str(mode).lower(),
+            'STACKTYP': str(mode).lower(),
             'STACKMOD': str(mode),
             'PROCSTEP': 'step9_stack',
+            STAGE_COL: STAGE_STACKED,
         }
         _sync_output_header_metadata(
             out_filepath,
@@ -761,7 +869,8 @@ def science_frame_stacking(comb_img_table, sci_mask, mode, scale='none', image_t
         if 'PLATE' in row:
             row['PLATE'] = str(plate_value)
         row['STACKED'] = True
-        row['STACKTYPE'] = str(mode).lower()
+        row['STACKTYP'] = str(mode).lower()
+        row[STAGE_COL] = STAGE_STACKED
         new_rows.append(row)
         path_to_result.append(out_filepath)
 
@@ -770,6 +879,7 @@ def science_frame_stacking(comb_img_table, sci_mask, mode, scale='none', image_t
 
     result = vstack([comb_img_table, Table(new_rows)])
     _ensure_string_columns(result, ['FILENAME', 'filename_input'])
+    _ensure_stage_column(result)
     return result, path_to_result
 
 
@@ -787,6 +897,7 @@ def step1_load(list_path, extra_columns, raw_dir, proc_dir):
         list_path,
         extra_columns=extra_columns,
     )
+    _ensure_stage_column(images_table, default_stage=STAGE_RAW)
 
     unresolved = images_table.meta.get('UNRESOLVED_AMBIGUOUS_SIGNATURES', [])
     PIPELINE_STATS['unresolved_ambiguous'] = len(unresolved)
@@ -805,7 +916,7 @@ def _make_step2_lists(master_list_path, raw_dir, suffix='ot'):
 
     raw_inputs = [os.path.join(raw_dir, os.path.basename(name)) for name in entries]
     outputs = [
-        os.path.splitext(os.path.basename(name))[0] + f'-{suffix}.fits'
+        with_suffix(os.path.basename(name), f'-{suffix}')
         for name in entries
     ]
 
@@ -829,9 +940,12 @@ def step2_overscan_trim(images_table, master_list, raw_dir):
         raw_inlist, outlist = _make_step2_lists(inlist, raw_dir=raw_dir, suffix=suffix)
         pyraf_utils.run_ccdproc_ovefit_trim(raw_inlist, outlist)
 
-    images_table['filename_input'] = images_table['FILENAME'] + f'-{suffix}.fits'
-    images_table['FILENAME'] = images_table['FILENAME'] + f'-{suffix}'
+    affix = f'-{suffix}'
+    images_table['filename_input'] = [with_suffix(name, affix) for name in images_table['FILENAME']]
+    images_table['FILENAME'] = [with_suffix_stem(name, affix) for name in images_table['FILENAME']]
     _ensure_string_columns(images_table, ['FILENAME', 'filename_input'])
+    _ensure_stage_column(images_table, default_stage=STAGE_RAW)
+    images_table[STAGE_COL] = STAGE_TRIMMED
     return images_table
 
 
@@ -872,6 +986,7 @@ def step3_bias_stack(images_table):
             'filename_input': outpath,
             'SHOE': shoe,
             'OPAMP': opamp,
+            STAGE_COL: STAGE_STACKED,
         })
         if 'OBJECT_NORM' in col_names and _is_blank(row.get('OBJECT_NORM')):
             row['OBJECT_NORM'] = normalize_header_value(row.get('OBJECT', ''))
@@ -884,6 +999,7 @@ def step3_bias_stack(images_table):
 
     result = vstack([images_table, Table(new_rows)])
     _ensure_string_columns(result, ['FILENAME', 'filename_input'])
+    _ensure_stage_column(result)
     return result
 
 
@@ -929,11 +1045,12 @@ def step4_bias_correct(images_table):
             continue
 
         pyraf_utils.run_ccdproc_bias_corr(inlist_path, outlist_path, zero_image=str(mb_files[0]))
-        images_table['FILENAME'][mask] = images_table['FILENAME'][mask] + '-' + suffix
-        images_table['filename_input'][mask] = images_table['FILENAME'][mask] + '.fits'
+        filenames = [str(p) + '.fits' for p in subset['FILENAME']]
+        _update_table_filenames(images_table, mask, filenames, suffix, stage=STAGE_BIAS_CORRECTED)
         print(f'\t{shoe}{opamp} bias correction done')
 
     _ensure_string_columns(images_table, ['FILENAME', 'filename_input'])
+    _ensure_stage_column(images_table)
     return images_table
 
 
@@ -962,8 +1079,21 @@ def step5_mosaic(images_table):
         night = values['NIGHT']
         lctime = values['LC-TIME']
         shoe = values['SHOE']
-        plate_value = values.get('PLATE', '')
         subset = images_table[indices].copy()
+
+        plate_values = []
+        if 'PLATE' in subset.colnames:
+            plate_values = sorted(
+                {str(v).strip() for v in subset['PLATE'] if not _is_blank(v)}
+            )
+        if len(plate_values) > 1:
+            print(
+                "WARNING [step5_mosaic]: conflicting non-blank PLATE values "
+                f"for NIGHT={night} LC-TIME={lctime} SHOE={shoe}: {plate_values}. "
+                f"Using '{plate_values[0]}'."
+            )
+        plate_value = plate_values[0] if plate_values else ''
+
         opamp_tokens = {_normalize_opamp(v) for v in subset['OPAMP']}
         expected = {'1', '2', '3', '4'}
 
@@ -992,6 +1122,7 @@ def step5_mosaic(images_table):
             'SHOE': str(shoe),
             'PLATE': str(plate_value),
             'PROCSTEP': 'step5_mosaic',
+            STAGE_COL: STAGE_MOSAIC,
         }
         _sync_output_header_metadata(
             out_filename,
@@ -1013,6 +1144,7 @@ def step5_mosaic(images_table):
         row['CLASS_REASON'] = 'step5_mosaic'
         row['EXPTYPE_NORM'] = normalize_header_value(row['EXPTYPE'])
         row['OBJECT_NORM'] = normalize_header_value(row['OBJECT'])
+        row[STAGE_COL] = STAGE_MOSAIC
         mosaics.append(row)
 
     if not mosaics:
@@ -1021,6 +1153,7 @@ def step5_mosaic(images_table):
 
     combined_images = Table(mosaics)
     _ensure_string_columns(combined_images, ['FILENAME', 'filename_input'])
+    _ensure_stage_column(combined_images, default_stage=STAGE_MOSAIC)
     return combined_images
 
 
@@ -1077,6 +1210,12 @@ def step7_dark_subtract(combined_images, object_name=None, dark_override=None):
         combined_images['IMAGE_TYPE'],
         sorted(PROCESSABLE_CRR_IMAGE_TYPES),
     )
+    if STAGE_COL in combined_images.colnames:
+        target_mask = target_mask & _stage_mask(
+            combined_images,
+            [STAGE_MOSAIC],
+            default_stage=STAGE_MOSAIC,
+        )
 
     if object_name:
         object_norm = normalize_header_value(object_name)
@@ -1089,7 +1228,7 @@ def step7_dark_subtract(combined_images, object_name=None, dark_override=None):
             print('WARNING [step7_dark_subtract]: OBJECT_NORM missing; cannot apply --object filter.')
 
     if not np.any(target_mask):
-        print('No processable non-dark frames selected for dark subtraction; continuing.')
+        print('No mosaic-stage processable non-dark frames selected for dark subtraction; continuing.')
         return combined_images, non_dark_mask
 
     if not np.any(combined_images['IMAGE_TYPE'] == 'DARK_MASTER'):
@@ -1106,12 +1245,13 @@ def step7_dark_subtract(combined_images, object_name=None, dark_override=None):
         for row in combined_images[combined_images['IMAGE_TYPE'] == 'DARK_MASTER']:
             if not _same_shoe(row['SHOE'], shoe_value):
                 continue
-            resolved = _resolve_existing_dark_path(row['filename_input'])
-            if resolved is None:
+            raw_path = str(row['filename_input']).strip()
+            if not raw_path:
                 continue
+            resolved = _resolve_existing_dark_path(raw_path)
             rows.append(
                 {
-                    'path': resolved,
+                    'path': resolved if resolved is not None else raw_path,
                     'night': str(row['NIGHT']).strip(),
                     'plate': str(row['PLATE']).strip(),
                     'source': 'table',
@@ -1204,9 +1344,18 @@ def step7_dark_subtract(combined_images, object_name=None, dark_override=None):
             return chosen
 
         shoe_value = group_values['SHOE']
+        plate_value = str(group_values.get('PLATE', '')).strip()
         records = _candidate_records_from_table(shoe_value)
         records.extend(_candidate_records_from_cwd(shoe_value))
         records = _dedupe_candidates(records)
+
+        if plate_value:
+            plate_matched = [
+                rec for rec in records
+                if str(rec.get('plate', '')).strip() == plate_value
+            ]
+            if plate_matched:
+                records = plate_matched
 
         if len(records) == 1:
             return records[0]['path']
@@ -1214,12 +1363,13 @@ def step7_dark_subtract(combined_images, object_name=None, dark_override=None):
         if len(records) > 1:
             if _is_interactive_stdin():
                 return _prompt_candidate_choice(records, shoe_value)
-            _warn_skip_group(
-                'step7_dark_subtract',
-                'multiple same-SHOE DARK_MASTER candidates found for '
-                f"SHOE={shoe_value}. Provide --dark or rerun interactively.",
+            print(
+                'INFO [step7_dark_subtract]: multiple DARK_MASTER candidates found for '
+                f"SHOE={shoe_value}"
+                + (f" PLATE={plate_value}" if plate_value else "")
+                + f"; selecting first in non-interactive mode: {records[0]['path']}"
             )
-            return None
+            return records[0]['path']
 
         if _is_interactive_stdin():
             return _prompt_manual_dark_path(shoe_value)
@@ -1263,6 +1413,11 @@ def step8_crr_science(combined_images):
         return combined_images
 
     crr_mask = np.isin(combined_images['IMAGE_TYPE'], sorted(PROCESSABLE_CRR_IMAGE_TYPES))
+    crr_mask = crr_mask & _stage_mask(
+        combined_images,
+        [STAGE_DARK_SUBTRACTED, STAGE_MOSAIC],
+        default_stage=STAGE_MOSAIC,
+    )
     if not np.any(crr_mask):
         print('No SCIENCE/TWILIGHT/QUARTZ/LAMP frames to CR-clean; continuing.')
         return combined_images
@@ -1287,6 +1442,11 @@ def step9_stack_science(combined_images, object_name=None):
 
     for image_type, (mode, scale) in STACKING_STRATEGY.items():
         mask = stacked['IMAGE_TYPE'] == image_type
+        mask = mask & _stage_mask(
+            stacked,
+            [STAGE_CR_CLEANED, STAGE_DARK_SUBTRACTED, STAGE_MOSAIC],
+            default_stage=STAGE_MOSAIC,
+        )
         if image_type == 'SCIENCE' and object_norm:
             if 'OBJECT_NORM' in stacked.colnames:
                 mask = mask & (stacked['OBJECT_NORM'] == object_norm)
@@ -1313,6 +1473,11 @@ def step10_flatfield(combined_images, flatpath, object_name=None):
         return combined_images
 
     sci_mask = combined_images['IMAGE_TYPE'] == 'SCIENCE'
+    sci_mask = sci_mask & _stage_mask(
+        combined_images,
+        [STAGE_STACKED],
+        default_stage=STAGE_RAW,
+    )
     if object_name and 'OBJECT_NORM' in combined_images.colnames:
         sci_mask = sci_mask & (combined_images['OBJECT_NORM'] == normalize_header_value(object_name))
 

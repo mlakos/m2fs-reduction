@@ -465,6 +465,15 @@ class TraceViewer:
     # ------------------------------------------------------------------
     def _build_figure(self):
         self.fig, self.ax_cut = plt.subplots(1, 1, figsize=(16, 9))
+        # Disable matplotlib's default keymap handler (notably 'q' to quit)
+        # so q/g confirmation is controlled only by this viewer.
+        manager = getattr(self.fig.canvas, "manager", None)
+        default_key_handler_id = getattr(manager, "key_press_handler_id", None)
+        if default_key_handler_id is not None:
+            try:
+                self.fig.canvas.mpl_disconnect(default_key_handler_id)
+            except Exception:
+                pass
         self.fig.canvas.mpl_connect("key_press_event", self._on_key)
         self.fig.canvas.mpl_connect("motion_notify_event", self._on_motion)
 
@@ -581,6 +590,10 @@ class TraceViewer:
     def _on_key(self, event):
         key = event.key
 
+        if key not in ("q", "g") and self._quit_armed:
+            self._quit_armed = False
+            print("  [q/g] Quit confirmation cleared.")
+
         # ---- h: help ---------------------------------------------------
         if key == "h":
             print(textwrap.dedent("""
@@ -594,7 +607,8 @@ class TraceViewer:
                 f   Recompute affiliations forward from the last edited aperture.
                     Manual edits and deleted apertures are locked and preserved.
                 r   Reset ALL assignments to the auto-generated pattern.
-                q/g Accept current mapping, save PNGs, and continue.
+                q/g First press arms quit; second q/g accepts mapping, saves PNGs,
+                    and continues.
                 h   Print this help text.
             """))
             return
@@ -671,11 +685,17 @@ class TraceViewer:
 
         # ---- q/g: accept mapping and finish -----------------------------
         if key in ("q", "g"):
+            if not self._quit_armed:
+                self._quit_armed = True
+                print("\n  [q/g] Quit armed. Press q or g again to accept mapping and close.")
+                return
+
             print("\n  [q/g] Mapping accepted.  Closing preview window.")
             try:
                 self._save_confirmation_figures(dpi=300)
             except Exception as exc:
                 print(f"  [warn] Could not save confirmation figures: {exc}")
+            self._quit_armed = False
             self.done = True
             plt.close(self.fig)
             return
@@ -723,6 +743,49 @@ def save_mapping(path, image_name, centers, pattern):
         for i, (cen, star) in enumerate(zip(centers, pattern)):
             f.write(f"  {i+1:>4}  {cen:>10.2f}  {star:>5}\n")
     print(f"  Mapping saved to: {path}")
+
+
+def prepare_preview_state(image_path, nap=None, sep=5.0, col=None, n_stars=4):
+    """Build preview inputs without opening UI or prompting the user."""
+    data = load_image(image_path)
+    nrows, ncols = data.shape
+    resolved_col = col if col is not None else ncols // 2
+
+    trace_info = load_iraf_traces(image_path, ncols)
+    trace_rows = trace_info["trace_rows"]
+
+    if trace_info["source"] == "database":
+        centers = trace_info["centers"]
+    else:
+        try:
+            centers = find_aperture_centers(data, col=resolved_col, expected_sep=sep)
+        except ImportError:
+            n = nap if nap else int(nrows / max(1, sep))
+            centers = np.linspace(sep, nrows - sep, n)
+
+    if nap is not None and len(centers) != nap:
+        if len(centers) > nap:
+            centers = centers[:nap]
+            trace_rows = {k: v for k, v in trace_rows.items() if k < nap}
+        else:
+            extra = np.linspace(centers[-1] + sep, nrows - 1, nap - len(centers))
+            centers = np.concatenate([centers, extra])
+
+    pattern = default_pattern(len(centers), n_stars=n_stars)
+    image_name = os.path.basename(image_path)
+
+    return {
+        "data": data,
+        "nrows": nrows,
+        "ncols": ncols,
+        "col": resolved_col,
+        "trace_info": trace_info,
+        "trace_rows": trace_rows,
+        "centers": centers,
+        "pattern": pattern,
+        "image_name": image_name,
+        "n_stars": n_stars,
+    }
 
 
 def main():
@@ -802,7 +865,7 @@ def main():
 
     if not viewer.done:
         raise RuntimeError(
-            "Preview closed without confirmation. Press 'q' twice to accept the mapping "
+            "Preview closed without confirmation. Press 'q' or 'g' twice to accept the mapping "
             "and trigger PNG exports."
         )
 
@@ -825,7 +888,8 @@ def main():
 
 # ── convenience wrapper for calling from a notebook / other script ──────────
 
-def run_preview(image_path, nap=None, sep=5.0, col=None, n_stars=4, out=None):
+def run_preview(image_path, nap=None, sep=5.0, col=None, n_stars=4, out=None,
+                interactive=True, pattern_override=None):
     """
     Programmatic entry point – mirrors the CLI but returns (centers, pattern).
 
@@ -836,12 +900,31 @@ def run_preview(image_path, nap=None, sep=5.0, col=None, n_stars=4, out=None):
                                         n_stars=4)
         # then call apall …
     """
-    data = load_image(image_path)
-    nrows, ncols = data.shape
-    _col = col if col is not None else ncols // 2
+    state = prepare_preview_state(
+        image_path,
+        nap=nap,
+        sep=sep,
+        col=col,
+        n_stars=n_stars,
+    )
 
-    trace_info = load_iraf_traces(image_path, ncols)
-    trace_rows = trace_info["trace_rows"]
+    data = state["data"]
+    nrows = state["nrows"]
+    ncols = state["ncols"]
+    _col = state["col"]
+    trace_info = state["trace_info"]
+    trace_rows = state["trace_rows"]
+    centers = state["centers"]
+    pattern = np.array(state["pattern"], dtype=int)
+    image_name = state["image_name"]
+
+    if pattern_override is not None:
+        pattern = np.array(pattern_override, dtype=int)
+        if len(pattern) != len(centers):
+            raise ValueError(
+                "pattern_override length does not match detected aperture count "
+                f"({len(pattern)} != {len(centers)})."
+            )
 
     if trace_info["source"] == "database":
         print(
@@ -849,29 +932,16 @@ def run_preview(image_path, nap=None, sep=5.0, col=None, n_stars=4, out=None):
             f"({trace_info['parsed']} parsed, {trace_info['skipped']} skipped)"
         )
         print(f"  DB file: {trace_info['db_path']}")
-        centers = trace_info["centers"]
     else:
         print("  Trace source: peak finder fallback")
         print(f"  Finding aperture centres (spatial cut at col={_col}) …")
 
-        try:
-            centers = find_aperture_centers(data, col=_col, expected_sep=sep)
-        except ImportError:
-            n = nap if nap else int(nrows / max(1, sep))
-            centers = np.linspace(sep, nrows - sep, n)
-
-    if nap is not None and len(centers) != nap:
-        if len(centers) > nap:
-            centers = centers[:nap]
-            trace_rows = {k: v for k, v in trace_rows.items() if k < nap}
-        else:
-            extra = np.linspace(centers[-1] + sep, nrows - 1, nap - len(centers))
-            centers = np.concatenate([centers, extra])
-
-    pattern = default_pattern(len(centers), n_stars=n_stars)
-    image_name = os.path.basename(image_path)
     outpath = out or f"{os.path.splitext(image_name)[0]}_star_map.txt"
     save_prefix = str(Path(outpath).with_suffix(""))
+
+    if not interactive:
+        save_mapping(outpath, image_name, centers, pattern)
+        return centers, pattern
 
     viewer = TraceViewer(
         data,
@@ -890,7 +960,7 @@ def run_preview(image_path, nap=None, sep=5.0, col=None, n_stars=4, out=None):
 
     if not viewer.done:
         raise RuntimeError(
-            "Preview closed without confirmation. Press 'q' twice to accept the mapping "
+            "Preview closed without confirmation. Press 'q' or 'g' twice to accept the mapping "
             "and trigger PNG exports."
         )
 

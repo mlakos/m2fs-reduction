@@ -72,6 +72,7 @@ Usage
 import argparse
 import csv
 import glob
+import hashlib
 import json
 import os
 import re
@@ -88,6 +89,17 @@ from file_handler import (
     load_image_type_overrides,
     normalize_header_value,
     save_image_type_overrides,
+)
+from naming_helper import (
+    fits_stem,
+    normalize_step2_like_input,
+    step11_dispcor,
+    step2_scattered,
+    step3_master_flat,
+    step3_median,
+    step4_flat_corrected,
+    step6_star_extract,
+    step7_crr2,
 )
 
 
@@ -112,7 +124,7 @@ def load_packages():
 
 def stem(path):
     """Basename without .fits extension."""
-    return os.path.splitext(os.path.basename(path))[0]
+    return fits_stem(path)
 
 
 def _safe_token(value):
@@ -226,7 +238,7 @@ def read_required_metadata(filepath):
         "SHOE": str(hdr["SHOE"]),
         "PLATE": str(hdr.get("PLATE", "")).strip(),
         "STACKED": bool(hdr.get("STACKED", False)),
-        "STACKTYPE": str(hdr.get("STACKTYPE", "")),
+        "STACKTYP": str(hdr.get("STACKTYP", hdr.get("STACKTYPE", ""))),
         "STACKMOD": str(hdr.get("STACKMOD", "")),
     }
 
@@ -236,7 +248,7 @@ def is_stacked_product(meta):
     if meta.get("STACKED", False):
         return True
 
-    stype = str(meta.get("STACKTYPE", "")).strip().lower()
+    stype = str(meta.get("STACKTYP", "")).strip().lower()
     smod = str(meta.get("STACKMOD", "")).strip().lower()
     if stype in {"sum", "median", "average"}:
         return True
@@ -471,7 +483,7 @@ def collect_header_inventory(args, resolved, required_roles=None):
             "SHOE": shoe,
             "PLATE": plate,
             "STACKED": bool(hdr.get("STACKED", False)),
-            "STACKTYPE": str(hdr.get("STACKTYPE", "")),
+            "STACKTYP": str(hdr.get("STACKTYP", hdr.get("STACKTYPE", ""))),
             "STACKMOD": str(hdr.get("STACKMOD", "")),
             "OPAMP": str(hdr.get("OPAMP", "")),
             "LC-TIME": str(hdr.get("LC-TIME", "")),
@@ -567,13 +579,52 @@ def _format_inventory_combinations(groups):
     return lines
 
 
+def _can_prompt_user():
+    """Return True when interactive prompting is available."""
+    stdin_tty = None
+    try:
+        stdin_tty = bool(sys.stdin.isatty())
+        if stdin_tty:
+            return True
+    except Exception:
+        stdin_tty = None
+
+    # Respect explicit non-interactive stdin (e.g. tests, pipelines).
+    if stdin_tty is False:
+        return False
+
+    try:
+        return os.path.exists("/dev/tty") and os.access("/dev/tty", os.R_OK | os.W_OK)
+    except Exception:
+        return False
+
+
+def _prompt_input(prompt):
+    """Read interactive input from stdin, falling back to /dev/tty."""
+    try:
+        stdin_tty = bool(sys.stdin.isatty())
+        if stdin_tty:
+            return input(prompt)
+        return ""
+    except Exception:
+        pass
+
+    try:
+        with open("/dev/tty", "r+") as tty:
+            tty.write(prompt)
+            tty.flush()
+            return tty.readline().rstrip("\n")
+    except Exception:
+        return ""
+
+
 def _prompt_numbered_menu(question, options, text_aliases=None):
     print(question)
     for idx, option in enumerate(options, start=1):
         print(f"[{idx}] {option}")
 
     while True:
-        answer = input("Selection (Enter to skip): ").strip()
+        answer = _prompt_input("Selection (Enter to skip): ").strip()
         if not answer:
             return None
         if text_aliases:
@@ -599,7 +650,7 @@ def _prompt_numbered_menu(question, options, text_aliases=None):
 
 
 def _prompt_for_missing_roles_from_inventory(args, missing_roles, inventory):
-    interactive = sys.stdin.isatty()
+    interactive = _can_prompt_user()
     groups = list(inventory.get("groups", []))
     selected = {}
     updated_overrides = False
@@ -790,7 +841,7 @@ def _select_unique_candidate(role, candidates):
 
         # Identical rank and same shoe: still ambiguous, fail
         if len(tied) > 1:
-            if role == "object" and sys.stdin.isatty():
+            if role == "object" and _can_prompt_user():
                 selected = _prompt_for_object_candidate(tied)
                 if selected is not None:
                     return selected
@@ -863,6 +914,11 @@ def _resolve_role_from_inventory_group(role, group):
         return selected_meta["path"] if selected_meta is not None else None
 
     filtered = _filter_reduce_stage_candidates(all_candidates)
+    if not filtered and len(all_candidates) == 1:
+        # Inventory prompt flow may intentionally resolve from raw/header-only
+        # groups (e.g., pre-preprocess labeling). Preserve that behavior.
+        return all_candidates[0].get("path")
+
     if not filtered:
         label = (
             f"NIGHT={group.get('night', '')} SHOE={group.get('shoe', '')} "
@@ -1026,8 +1082,8 @@ def resolve_inputs(args, required_roles=None):
         resolved.update(prompted)
         missing = [r for r in required_roles if r not in resolved]
 
-    if "dark" in missing and sys.stdin.isatty():
-        manual_dark = input(
+    if "dark" in missing and _can_prompt_user():
+        manual_dark = _prompt_input(
             "No DARK_MASTER was auto-discovered. Enter manual --dark path "
             "(or press Enter to skip): "
         ).strip()
@@ -1044,7 +1100,8 @@ def resolve_inputs(args, required_roles=None):
             f"{', '.join(missing)}."
         ]
         if inventory is not None:
-            details.append("Discovered unique NIGHT/SHOE/PLATE/EXPTYPE/OBJECT combinations:")
+            details.append("Discovered unique EXPTYPE/OBJECT combinations:")
+            details.append("(with NIGHT/SHOE/PLATE context)")
             details.extend(_format_inventory_combinations(inventory.get("groups", [])))
             if inventory.get("skipped_missing", 0):
                 details.append(
@@ -1057,7 +1114,7 @@ def resolve_inputs(args, required_roles=None):
                     "  [info] Multiple SHOEs discovered in current run context: "
                     f"{', '.join(shoe_options)}"
                 )
-        if not sys.stdin.isatty():
+        if not _can_prompt_user():
             details.append(
                 "Non-interactive mode cannot prompt for unresolved roles. "
                 "Provide explicit flags or rerun in a TTY."
@@ -1118,13 +1175,13 @@ def validate_input_set(meta_by_role, args):
         print("  --yes set: continuing despite metadata warnings.")
         return
 
-    if not sys.stdin.isatty():
+    if not _can_prompt_user():
         raise RuntimeError(
             "Metadata mismatch detected in non-interactive mode. "
             "Re-run with --yes to continue anyway."
         )
 
-    answer = input("\nProceed anyway? Type 'yes' to continue: ").strip().lower()
+    answer = _prompt_input("\nProceed anyway? Type 'yes' to continue: ").strip().lower()
     if answer != "yes":
         raise RuntimeError("Aborted by user after metadata mismatch warning.")
 
@@ -1231,14 +1288,29 @@ def apall_trace_quartz(quartz, n_ap):
 # Step 2 – apscatter on all four images
 # ---------------------------------------------------------------------------
 
-def _apscatter_one(image, output, reference):
+def _apscatter_one(image, output, reference, proc_dir=None):
+    iraf_input = os.path.basename(str(image).split("[", 1)[0])
+    iraf_reference = quartz_reference_token(reference)
+
+    try:
+        iraf_cwd = iraf.pwd()
+    except Exception:
+        iraf_cwd = "<unavailable>"
+    print(
+        "  [debug step2 pre] "
+        f"python_cwd={os.getcwd()} iraf_cwd={iraf_cwd} "
+        f"input={image} iraf_input={iraf_input} "
+        f"reference={reference} iraf_reference={iraf_reference} output={output} "
+        "interactive=yes fitscatter=yes fitsmooth=yes"
+    )
+
     iraf.echelle.apscatter.unlearn()
     iraf.echelle.apscatter(
-        input       = image,
+        input       = iraf_input,
         output      = output,
         apertures   = "",
         scatter     = "",
-        references  = reference,    # quartz aperture database
+        references  = iraf_reference,
         interactive = iraf.yes,
         find        = iraf.no,
         recenter    = iraf.no,
@@ -1257,22 +1329,68 @@ def _apscatter_one(image, output, reference):
         apscat2     = "",
         mode        = "ql",
     )
+
+    in_dir = os.path.dirname(str(image))
+    in_dir_output = os.path.join(in_dir, output) if in_dir else output
+    proc_dir_output = os.path.join(proc_dir, output) if proc_dir else output
+    exists_local = os.path.exists(output)
+    exists_input_dir = os.path.exists(in_dir_output)
+    exists_proc_dir = os.path.exists(proc_dir_output)
+    size_local = os.path.getsize(output) if exists_local else None
+    size_input_dir = os.path.getsize(in_dir_output) if exists_input_dir else None
+    size_proc_dir = os.path.getsize(proc_dir_output) if exists_proc_dir else None
+    print(
+        "  [debug step2 post] "
+        f"output={output} exists_local={exists_local} size_local={size_local} "
+        f"exists_proc_dir={exists_proc_dir} size_proc_dir={size_proc_dir} "
+        f"exists_input_dir={exists_input_dir} size_input_dir={size_input_dir}"
+    )
+
     print(f"  apscatter done: {image} -> {output}")
 
 
-def apscatter_all(quartz, thar, obj, twilight):
+def apscatter_all(quartz, thar, obj, twilight, proc_dir=None):
     section_banner("Step 2 – apscatter (scattered-light subtraction)")
     inputs = [quartz, thar, obj, twilight]
-    outputs = [stem(img) + "-sl.fits" for img in inputs]
+    outputs = [step2_scattered(img) for img in inputs]
 
     for out in outputs:
         iraf_delete(out)
 
     for img, out in zip(inputs, outputs):
         print(f"\n  -- {img} -> {out}")
-        _apscatter_one(img, out, reference=quartz)
+        _apscatter_one(img, out, reference=quartz, proc_dir=proc_dir)
 
     return tuple(outputs)
+
+
+def _step2_interactive_preflight(require_interactive=True):
+    """Best-effort preflight for interactive apscatter readiness."""
+    stdin_tty = bool(getattr(sys.stdin, "isatty", lambda: False)())
+    stdout_tty = bool(getattr(sys.stdout, "isatty", lambda: False)())
+    stderr_tty = bool(getattr(sys.stderr, "isatty", lambda: False)())
+    display = os.environ.get("DISPLAY", "")
+    gterm = os.environ.get("stdgraph", "")
+    print(
+        "  [debug step2 preflight] "
+        f"stdin_tty={stdin_tty} stdout_tty={stdout_tty} stderr_tty={stderr_tty} "
+        f"DISPLAY={display or '<unset>'} stdgraph={gterm or '<unset>'}"
+    )
+
+    if require_interactive and not (stdin_tty and stdout_tty and stderr_tty):
+        raise RuntimeError(
+            "Step 2 requires an interactive terminal (stdin/stdout/stderr TTY). "
+            "Run in an interactive shell session."
+        )
+
+
+def _debug_apscatter_quartz_only(quartz, proc_dir):
+    """Temporary debug helper: run apscatter only on quartz and validate output."""
+    section_banner("Step 2 DEBUG – apscatter quartz-only")
+    quartz_sl = step2_scattered(quartz)
+    _apscatter_one(quartz, quartz_sl, reference=quartz, proc_dir=proc_dir)
+    require_existing(quartz_sl, "step 2 debug quartz-sl output", proc_dir=proc_dir)
+    print(f"  step2-debug quartz output verified: {quartz_sl}")
 
 
 # ---------------------------------------------------------------------------
@@ -1288,13 +1406,12 @@ def make_normalised_flat(quartz, xwindow=10):
     Returns the path of the master flat.
     """
     section_banner("Step 3 – Normalised master flat")
-    q_stem      = stem(quartz)
-    median_flat = q_stem + "_med.fits"
-    master_flat = q_stem + "_nflat.fits"
+    median_flat = step3_median(quartz)
+    master_flat = step3_master_flat(quartz)
 
     # 3a – fmedian
     iraf_delete(median_flat)
-    print(f"  fmedian  {quartz}  ->  {median_flat}  (xwindow=19, ywindow=1)")
+    print(f"  fmedian  {quartz}  ->  {median_flat}  (xwindow={xwindow}, ywindow=1)")
     iraf.images.imfilter.fmedian.unlearn()
     iraf.images.imfilter.fmedian(
         input     = quartz,
@@ -1359,7 +1476,7 @@ def flatcorrect_images(thar, obj, twilight, master_flat):
     section_banner("Step 4 – Flat-field correction (ccdproc)")
 
     targets  = [thar, obj, twilight]
-    outputs  = [stem(t) + "-F.fits" for t in targets]
+    outputs  = [step4_flat_corrected(t) for t in targets]
 
     context_meta = None
     for candidate in (obj, thar, twilight):
@@ -1438,7 +1555,8 @@ def flatcorrect_images(thar, obj, twilight, master_flat):
 # Step 5 – interactive aperture-trace preview (just before extraction)
 # ---------------------------------------------------------------------------
 
-def run_aperture_preview(preview_image, n_stars, sep, preview_out=None):
+def run_aperture_preview(preview_image, n_stars, sep, preview_out=None,
+                        interactive=True, pattern_override=None):
     """
     Open the interactive matplotlib preview on a reference image for assigning
     aperture traces to stars. This does not require the final extraction image;
@@ -1472,6 +1590,8 @@ def run_aperture_preview(preview_image, n_stars, sep, preview_out=None):
         n_stars=n_stars,
         sep=sep,
         out=preview_out,
+        interactive=interactive,
+        pattern_override=pattern_override,
     )
 
     # Print a summary for the terminal log
@@ -1562,8 +1682,8 @@ def _apall_extract_star(image, reference_quartz, aperture_string,
     -------
     Path of the extracted multispec FITS file.
     """
-    out_stem = f"{stem(image)}_star{star_number:02d}_ec"
-    out_spec = out_stem + ".fits"
+    out_spec = step6_star_extract(image, star_number)
+    out_stem = stem(out_spec)
     iraf_delete(out_spec)
 
     print(f"      apall  apertures={aperture_string!r}  ->  {out_spec}")
@@ -1791,7 +1911,7 @@ def second_cosmic_removal(obj_outputs):
     crr2_outputs = {}
     for star in sorted(obj_outputs):
         in_spec  = obj_outputs[star]
-        out_spec = stem(in_spec) + "-crr2.fits"
+        out_spec = step7_crr2(in_spec)
         print(f"\n  -- Star {star:02d}  |  {in_spec}")
         _lineclean_one(in_spec, out_spec)
         crr2_outputs[star] = out_spec
@@ -1801,7 +1921,7 @@ def second_cosmic_removal(obj_outputs):
 
 def expected_step7_outputs(obj_outputs):
     """Return deterministic step-7 output paths."""
-    return {star: stem(path) + "-crr2.fits" for star, path in obj_outputs.items()}
+    return {star: step7_crr2(path) for star, path in obj_outputs.items()}
 
 
 # ---------------------------------------------------------------------------
@@ -2238,7 +2358,7 @@ def _review_reidentified_lines(thar_ec, coordlist):
     print(f"  review complete: {thar_ec}")
 
 
-def _refspec_one(obj_ec, thar_ec):
+def _refspec_one(obj_ec, thar_ec, debug=False):
     """
     Assign the ThAr wavelength solution from *thar_ec* to the object
     spectrum *obj_ec* using refspec.
@@ -2247,11 +2367,19 @@ def _refspec_one(obj_ec, thar_ec):
     is correct because object and ThAr were extracted from the same aperture
     set in step 6.
     """
-    print(f"  refspec: {obj_ec}  <--  {thar_ec}")
+    obj_iraf = os.path.basename(str(obj_ec).split("[", 1)[0])
+    ref_iraf = os.path.basename(str(thar_ec).split("[", 1)[0])
+    ref_db_token = iraf_spec_token(thar_ec)
+    print(
+        "  refspec: "
+        f"object_file={obj_ec} object_iraf={obj_iraf}  <--  "
+        f"ref_file={thar_ec} ref_iraf={ref_iraf} ref_db_token={ref_db_token} "
+        f"[debug={'yes' if debug else 'no'}]"
+    )
     iraf.noao.onedspec.refspec.unlearn()
     iraf.noao.onedspec.refspec(
-        input    = obj_ec,
-        referenc = thar_ec,
+        input    = obj_iraf,
+        referenc = ref_iraf,
         aperture = "",
         refaps   = "",
         ignoreap = iraf.no,
@@ -2260,13 +2388,27 @@ def _refspec_one(obj_ec, thar_ec):
         group    = "",
         time     = iraf.no,
         timewrap = 17.0,
-        override = iraf.no,
-        confirm  = iraf.no,
+        override = iraf.yes if debug else iraf.no,
+        confirm  = iraf.yes if debug else iraf.no,
         assign   = iraf.yes,
         logfile  = "STDOUT,logfile",
-        verbose  = iraf.no,
+        verbose  = iraf.yes if debug else iraf.no,
         mode     = "ql",
     )
+
+    try:
+        hdr = fits.getheader(obj_ec)
+        refspec_keys = [
+            str(key) for key in hdr.keys()
+            if str(key) == "REFSPEC" or re.match(r"^REFSPEC\d+$", str(key))
+        ]
+        if refspec_keys:
+            joined = ", ".join(f"{key}={hdr.get(key)}" for key in sorted(refspec_keys))
+            print(f"  refspec header keys: {joined}")
+        else:
+            print("  refspec header keys: <none>")
+    except Exception as exc:
+        print(f"  [warn] could not inspect object REFSPEC header keys: {exc}")
 
 
 def _dispcor_one(obj_ec, output_spec):
@@ -2321,7 +2463,7 @@ def _choose_step8_mode(step8_mode):
     if step8_mode in {"manual", "reuse"}:
         return step8_mode
 
-    if not sys.stdin.isatty():
+    if not _can_prompt_user():
         print("  step 8 mode: non-interactive run, defaulting to manual ecidentify")
         return "manual"
 
@@ -2330,7 +2472,7 @@ def _choose_step8_mode(step8_mode):
     print("    [r] reuse existing identified ThAr (run ecreidentify)")
 
     while True:
-        answer = input("  Choose mode [m/r] (default: m): ").strip().lower()
+        answer = _prompt_input("  Choose mode [m/r] (default: m): ").strip().lower()
         if answer in {"", "m", "manual"}:
             return "manual"
         if answer in {"r", "reuse"}:
@@ -2342,8 +2484,8 @@ def _resolve_reuse_reference_thar(reference_thar):
     """Resolve and validate external reference ThAr path for Step-8 reuse mode."""
     ref_path = reference_thar
 
-    if not ref_path and sys.stdin.isatty():
-        ref_path = input(
+    if not ref_path and _can_prompt_user():
+        ref_path = _prompt_input(
             "  Path to already identified reference ThAr FITS: "
         ).strip()
 
@@ -2374,11 +2516,21 @@ def _resolve_reuse_reference_thar(reference_thar):
     return ref_token
 
 
+def resolve_step8_runtime_config(step8_mode, step8_reference_thar=None):
+    """Resolve step-8 execution mode and optional reuse token before core logic."""
+    mode = _choose_step8_mode(step8_mode)
+    reference_token = None
+    if mode == "reuse":
+        reference_token = _resolve_reuse_reference_thar(step8_reference_thar)
+    return mode, reference_token
+
+
 def manual_wavelength_identification(crr2_outputs, thar_outputs,
                                      coordlist="linelists$thar.dat",
-                                     step8_mode="ask",
-                                     step8_reference_thar=None,
-                                     drift_log_path=None):
+                                     step8_mode="manual",
+                                     step8_reference_token=None,
+                                     drift_log_path=None,
+                                     explicit_ref_star=None):
     """
     Step 8: Reference-star wavelength setup (manual or reuse mode).
 
@@ -2387,7 +2539,8 @@ def manual_wavelength_identification(crr2_outputs, thar_outputs,
     identified external ThAr reference and its existing IRAF DB entry.
     Refspec assignment is deferred to step 10.
 
-    The reference star is the first star (minimum) in the star list.
+    Reference-star selection defaults to the first star unless an explicit
+    --ref-star override is provided by orchestration.
 
     Parameters
     ----------
@@ -2397,23 +2550,39 @@ def manual_wavelength_identification(crr2_outputs, thar_outputs,
         ThAr spectra from step 6 (same aperture selection as objects).
     coordlist    : str
         IRAF line-list path (default: built-in ThAr list).
-    step8_mode   : {'ask', 'manual', 'reuse'}
-        Step-8 mode selector.
-    step8_reference_thar : str or None
-        Path to identified reference ThAr for reuse mode.
+    step8_mode   : {'manual', 'reuse'}
+        Step-8 mode resolved by orchestration code.
+    step8_reference_token : str or None
+        Canonical ThAr reference token for reuse mode.
+    explicit_ref_star : int or None
+        Optional explicit reference star ID.
 
     Returns
     -------
     ref_star : int
-        The star number used as reference (minimum in sorted list).
+        The star number used as reference.
     """
     section_banner("Step 8 – Reference-star wavelength setup (manual/reuse)")
     iraf.noao()
     iraf.echelle()
     iraf.onedspec()
 
-    # Use first star (minimum) as reference
-    ref_star = min(crr2_outputs.keys())
+    available_stars = sorted(crr2_outputs.keys())
+    if explicit_ref_star is None:
+        ref_star = available_stars[0]
+    else:
+        ref_star = int(explicit_ref_star)
+        if ref_star not in crr2_outputs:
+            raise RuntimeError(
+                f"Requested --ref-star {ref_star:02d} is not available in extracted spectra. "
+                f"Available stars: {', '.join(f'{s:02d}' for s in available_stars)}"
+            )
+    if ref_star not in thar_outputs:
+        available_thar = ", ".join(f"{s:02d}" for s in sorted(thar_outputs.keys()))
+        raise RuntimeError(
+            f"Requested reference star {ref_star:02d} is not available in extracted ThAr spectra. "
+            f"Available stars: {available_thar}"
+        )
     obj_crr2_ref = crr2_outputs[ref_star]
     thar_ec_ref  = thar_outputs[ref_star]
 
@@ -2421,14 +2590,24 @@ def manual_wavelength_identification(crr2_outputs, thar_outputs,
     print(f"    object : {obj_crr2_ref}")
     print(f"    thar   : {thar_ec_ref}")
 
-    mode = _choose_step8_mode(step8_mode)
+    mode = step8_mode
+    if mode not in {"manual", "reuse"}:
+        raise RuntimeError(
+            f"Step 8 received unresolved mode '{mode}'. "
+            "Resolve mode before calling manual_wavelength_identification."
+        )
 
     if mode == "manual":
         # 8a – ecidentify on reference ThAr (interactive)
         _ecidentify_thar(thar_ec_ref, coordlist=coordlist)
     else:
         # 8a-alt – reuse external identified reference via ecreidentify.
-        ref_thar_external = _resolve_reuse_reference_thar(step8_reference_thar)
+        ref_thar_external = step8_reference_token
+        if not ref_thar_external:
+            raise RuntimeError(
+                "Step 8 reuse mode requires a resolved reference token. "
+                "Resolve via resolve_step8_runtime_config before calling core step logic."
+            )
         if stem(ref_thar_external) == stem(thar_ec_ref):
             print(
                 "  reuse mode: reference-star ThAr already matches reuse reference; "
@@ -2444,6 +2623,11 @@ def manual_wavelength_identification(crr2_outputs, thar_outputs,
                 drift_log_path=drift_log_path,
                 drift_stage="step8_reuse",
             )
+
+    try:
+        mark_spectrum_as_reference(thar_ec_ref)
+    except Exception as exc:
+        print(f"  [warn] could not stamp reference-star self REFSPEC header: {exc}")
 
     print("  Step 8 complete: reference ThAr wavelength solution ready for steps 9/10/11")
 
@@ -2497,7 +2681,7 @@ def auto_wavelength_propagation(crr2_outputs, thar_outputs, ref_star,
     print(
         "  Step 9 order: "
         + ", ".join(f"{int(s):02d}" for s in star_order)
-        + " (nearest in y to reference when geometry is available)"
+        + " (bidirectional outward from reference when geometry is available)"
     )
 
     for star in star_order:
@@ -2581,6 +2765,10 @@ def auto_wavelength_propagation(crr2_outputs, thar_outputs, ref_star,
                         f"{os.path.basename(transfer['temp_db_path'])} -> "
                         f"{os.path.basename(transfer['real_db_path'])}"
                     )
+                    try:
+                        mark_spectrum_as_reference(thar_ec)
+                    except Exception as exc:
+                        print(f"     [warn] self-reference stamp failed for real target ThAr: {exc}")
                     reviewed_thar_outputs[star] = thar_ec
             finally:
                 if prep is not None:
@@ -2609,7 +2797,8 @@ def auto_wavelength_propagation(crr2_outputs, thar_outputs, ref_star,
     }
 
 
-def apply_refspec_to_objects(crr2_outputs, thar_outputs, skip_stars=None):
+def apply_refspec_to_objects(crr2_outputs, thar_outputs, skip_stars=None,
+                             refspec_debug=False, target_stars=None):
     """Step 10: assign reviewed ThAr solutions to CR-cleaned object spectra."""
     section_banner("Step 10 – Refspec assignment to CR-cleaned object spectra")
     iraf.noao()
@@ -2617,8 +2806,20 @@ def apply_refspec_to_objects(crr2_outputs, thar_outputs, skip_stars=None):
 
     refspec_outputs = {}
     skip_stars = set(skip_stars or [])
+    target_stars = set(int(s) for s in (target_stars or []))
+
+    if target_stars:
+        print(
+            "  Step 10 star filter : "
+            + ", ".join(f"{int(s):02d}" for s in sorted(target_stars))
+        )
 
     for star in sorted(crr2_outputs):
+        if target_stars and star not in target_stars:
+            print(f"\n  -- Star {star:02d}")
+            print("     skip reason      : filtered by --step10-stars")
+            continue
+
         obj_crr2 = crr2_outputs[star]
         thar_ec = thar_outputs.get(star)
 
@@ -2647,16 +2848,61 @@ def apply_refspec_to_objects(crr2_outputs, thar_outputs, skip_stars=None):
             print("     skip reason      : could not normalize reviewed ThAr DB to canonical form")
             continue
 
+        refspec_db, refspec_token, alias_created = ensure_refspec_db_entry(
+            thar_ec,
+            source_db=canonical_db,
+        )
+        if not refspec_db:
+            print("     skip reason      : missing reviewed ThAr DB for REFSPEC alias preparation")
+            continue
+
         print(f"     wavelength token : {canonical_thar}")
         print(f"     wavelength DB    : {canonical_db}")
+        if alias_created:
+            print(f"     refspec alias DB : {refspec_db} ({refspec_token})")
+
+        has_self_ref, expected_token, self_ref_status = spectrum_has_self_reference(thar_ec)
+        if not has_self_ref:
+            print(
+                "     [repair] ThAr self-reference invalid "
+                f"({self_ref_status}); stamping REFSPEC1={expected_token}"
+            )
+            try:
+                mark_spectrum_as_reference(thar_ec, source_db=canonical_db)
+            except Exception as exc:
+                print(f"     skip reason      : could not repair ThAr self-reference ({exc})")
+                continue
+
+            has_self_ref, expected_token, self_ref_status = spectrum_has_self_reference(thar_ec)
+            if not has_self_ref:
+                print(
+                    "     skip reason      : ThAr self-reference invalid after repair "
+                    f"({self_ref_status})"
+                )
+                continue
+
+        print(f"     ThAr REFSPEC1    : {self_ref_status}")
         print("     refspec start    : real object <- real target")
-        _refspec_one(obj_crr2, canonical_thar)
+        _refspec_one(obj_crr2, thar_ec, debug=refspec_debug)
         print("     refspec end      : assignment complete; verifying object header")
 
         has_refspec, token_or_reason = object_has_refspec_assignment(obj_crr2, normalize=True)
         if not has_refspec:
-            print(f"     skip reason      : {token_or_reason}")
-            continue
+            print(f"     [fallback] refspec did not assign object header ({token_or_reason})")
+            try:
+                set_object_refspec_from_reference(
+                    obj_crr2,
+                    thar_ec,
+                    source_db=canonical_db,
+                )
+            except Exception as exc:
+                print(f"     skip reason      : object fallback assignment failed ({exc})")
+                continue
+
+            has_refspec, token_or_reason = object_has_refspec_assignment(obj_crr2, normalize=True)
+            if not has_refspec:
+                print(f"     skip reason      : object fallback assignment unresolved ({token_or_reason})")
+                continue
 
         print(f"     normalized token : {token_or_reason}")
         refspec_outputs[star] = obj_crr2
@@ -2672,6 +2918,150 @@ def _canonical_refspec_value(value):
 
     token = re.split(r"[\s,]+", text, maxsplit=1)[0]
     return canonical_wavelength_identity(token)
+
+
+REFSPEC_TOKEN_MAXLEN = 56
+
+
+def refspec_assignment_token(spectrum_path):
+    """Return a REFSPEC token safe for IRAF header parsing and DB lookup."""
+    canonical = iraf_spec_token(spectrum_path)
+    if len(canonical) <= REFSPEC_TOKEN_MAXLEN:
+        return canonical
+
+    digest = hashlib.sha1(canonical.encode("utf-8")).hexdigest()[:8]
+    keep = max(8, REFSPEC_TOKEN_MAXLEN - len(digest) - 1)
+    return f"{canonical[:keep]}_{digest}"
+
+
+def ensure_refspec_db_entry(spectrum_path, source_db=None):
+    """Ensure DB entry exists for the REFSPEC token used in FITS headers."""
+    canonical_token = iraf_spec_token(spectrum_path)
+    refspec_token = refspec_assignment_token(spectrum_path)
+
+    db_source = source_db
+    if not db_source:
+        db_source, _ = resolve_existing_wavelength_db(canonical_token)
+    if not db_source:
+        return None, refspec_token, False
+
+    if refspec_token == canonical_token:
+        return db_source, refspec_token, False
+
+    os.makedirs("database", exist_ok=True)
+    alias_db = os.path.join("database", f"ec{refspec_token}")
+    source_token = os.path.basename(str(db_source))
+    if source_token.startswith("ec"):
+        source_token = source_token[2:]
+    else:
+        source_token = canonical_token
+
+    with open(db_source, "r", encoding="utf-8", errors="ignore") as fh:
+        db_text = fh.read()
+
+    db_text = db_text.replace(source_token, refspec_token)
+    if canonical_token not in {source_token, refspec_token}:
+        db_text = db_text.replace(canonical_token, refspec_token)
+
+    with open(alias_db, "w", encoding="utf-8") as fh:
+        fh.write(db_text)
+
+    return alias_db, refspec_token, True
+
+
+def spectrum_has_self_reference(spectrum_path):
+    """Return (ok, expected_token, status_text) for ThAr self-reference header."""
+    expected = refspec_assignment_token(spectrum_path)
+    try:
+        hdr = fits.getheader(spectrum_path)
+    except Exception as exc:
+        return False, expected, f"header read failed ({exc})"
+
+    if "REFSPEC1" not in hdr:
+        return False, expected, "missing REFSPEC1"
+
+    actual = _canonical_refspec_value(hdr.get("REFSPEC1", ""))
+    if not actual:
+        return False, expected, "empty/invalid REFSPEC1"
+
+    if actual != expected:
+        return False, expected, f"REFSPEC1={actual} expected={expected}"
+
+    return True, expected, actual
+
+
+def mark_spectrum_as_reference(spectrum_path, source_db=None):
+    """Mark a spectrum as a self-reference by writing REFSPEC1=<self token>."""
+    canonical_token = iraf_spec_token(spectrum_path)
+    token = refspec_assignment_token(spectrum_path)
+    alias_db = None
+    alias_created = False
+
+    if token != canonical_token:
+        alias_db, token, alias_created = ensure_refspec_db_entry(
+            spectrum_path,
+            source_db=source_db,
+        )
+        if not alias_db:
+            raise RuntimeError(
+                "missing wavelength DB entry for long-token REFSPEC alias "
+                f"({canonical_token} -> {token})"
+            )
+
+    changed = False
+
+    with fits.open(spectrum_path, mode="update") as hdul:
+        hdr = hdul[0].header
+        old_refspec1 = str(hdr.get("REFSPEC1", "")).strip()
+        old_refspec2 = str(hdr.get("REFSPEC2", "")).strip() if "REFSPEC2" in hdr else ""
+
+        if old_refspec1 != token:
+            hdr["REFSPEC1"] = token
+            changed = True
+
+        removed_refspec2 = False
+        if "REFSPEC2" in hdr:
+            del hdr["REFSPEC2"]
+            removed_refspec2 = True
+            changed = True
+
+        if changed:
+            hdul.flush()
+
+    print(
+        "  [refspec-self] "
+        f"{os.path.basename(spectrum_path)}: "
+        f"REFSPEC1='{old_refspec1 or '<unset>'}' -> '{token}'"
+        + (f", removed REFSPEC2='{old_refspec2}'" if removed_refspec2 else "")
+        + (f", alias_db='{alias_db}'" if alias_created else "")
+    )
+    return changed
+
+
+def set_object_refspec_from_reference(obj_ec, thar_ec, source_db=None):
+    """Write object-side REFSPEC1 directly from reference ThAr token."""
+    _, token, _ = ensure_refspec_db_entry(thar_ec, source_db=source_db)
+    if not token:
+        raise RuntimeError("could not resolve REFSPEC token for object fallback assignment")
+
+    with fits.open(obj_ec, mode="update") as hdul:
+        hdr = hdul[0].header
+        old_refspec1 = str(hdr.get("REFSPEC1", "")).strip()
+        old_refspec2 = str(hdr.get("REFSPEC2", "")).strip() if "REFSPEC2" in hdr else ""
+
+        hdr["REFSPEC1"] = token
+        removed_refspec2 = False
+        if "REFSPEC2" in hdr:
+            del hdr["REFSPEC2"]
+            removed_refspec2 = True
+        hdul.flush()
+
+    print(
+        "     [fallback] object REFSPEC1 set directly: "
+        f"'{old_refspec1 or '<unset>'}' -> '{token}'"
+        + (f", removed REFSPEC2='{old_refspec2}'" if removed_refspec2 else "")
+    )
+    return token
 
 
 def object_has_refspec_assignment(obj_ec, normalize=False):
@@ -2883,7 +3273,7 @@ def apply_dispcor_to_objects(refspec_outputs, crr2_outputs=None, skip_reasons=No
         if input_obj is None:
             continue
 
-        output_dc = stem(input_obj) + "-dc.fits"
+        output_dc = step11_dispcor(input_obj)
 
         print(f"\n  -- Star {star:02d}")
         print(f"     input object     : {input_obj}")
@@ -2957,7 +3347,7 @@ def expected_step10_outputs(crr2_outputs):
 
 def expected_step11_outputs(refspec_outputs):
     """Return deterministic step-11 outputs (new dispcor products)."""
-    return {star: stem(path) + "-dc.fits" for star, path in refspec_outputs.items()}
+    return {star: step11_dispcor(path) for star, path in refspec_outputs.items()}
 
 
 # ---------------------------------------------------------------------------
@@ -3043,6 +3433,15 @@ def parse_args():
     p.add_argument("--coordlist", default="linelists$thar.dat",
                    help="IRAF line list for ecidentify steps 8-9 (default: linelists$thar.dat).")
     p.add_argument(
+        "--ref-star",
+        type=int,
+        default=None,
+        help=(
+            "Reference star number for steps 8-9. "
+            "Default: first available star (current behavior)."
+        ),
+    )
+    p.add_argument(
         "--step8-mode",
         default="ask",
         choices=["ask", "manual", "reuse"],
@@ -3067,6 +3466,11 @@ def parse_args():
             "Default: context-specific reidentify_drift_<NIGHT>_<SHOE>[_<PLATE>]_<OBJECT>.csv when inferable, "
             "otherwise reidentify_drift.csv."
         ),
+    )
+    p.add_argument(
+        "--debug-step2-quartz-only",
+        action="store_true",
+        help="Temporary debug mode: run Step 2 apscatter only on quartz and exit.",
     )
     p.add_argument(
         "--step9-gate-mode",
@@ -3095,6 +3499,39 @@ def parse_args():
         default=0.30,
         help="Step-9 maximum accepted ecreidentify RMS (default: 0.30).",
     )
+    p.add_argument(
+        "--step10-refspec-debug",
+        action="store_true",
+        help=(
+            "Enable interactive/verbose IRAF refspec debugging in step 10 "
+            "(confirm=yes, verbose=yes, override=yes)."
+        ),
+    )
+    p.add_argument(
+        "--step10-stars",
+        default=None,
+        help="Comma-separated star numbers to process in step 10 (others are skipped).",
+    )
+    p.add_argument(
+        "--retrofit-thar-refspec",
+        action="store_true",
+        help=(
+            "Scan existing extracted ThAr spectra in proc and stamp REFSPEC1=self-token "
+            "when a reviewed wavelength DB solution exists."
+        ),
+    )
+    p.add_argument(
+        "--retrofit-star",
+        type=int,
+        action="append",
+        default=None,
+        help="Optional star number filter for --retrofit-thar-refspec (repeatable).",
+    )
+    p.add_argument(
+        "--retrofit-only",
+        action="store_true",
+        help="Run retrofit operation and exit before pipeline steps.",
+    )
     p.add_argument("--no-cr", action="store_true",
                    help="Skip step-7 CR removal (keep step-6 *_ec.fits as-is).")
     return p.parse_args()
@@ -3108,6 +3545,31 @@ def selected_steps_from_args(args):
             f"than end-step ({args.end_step})."
         )
     return list(range(args.start_step, args.end_step + 1))
+
+
+def parse_star_selection_csv(value, flag_name):
+    """Parse comma-separated positive integer star IDs into a sorted set."""
+    if value is None:
+        return None
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    stars = set()
+    for chunk in text.split(","):
+        token = chunk.strip()
+        if not token:
+            continue
+        try:
+            star = int(token)
+        except ValueError as exc:
+            raise RuntimeError(f"{flag_name} contains non-integer token '{token}'") from exc
+        if star < 1:
+            raise RuntimeError(f"{flag_name} requires positive star numbers (got {star})")
+        stars.add(star)
+
+    return stars or None
 
 
 def required_roles_for_steps(selected_steps):
@@ -3135,14 +3597,7 @@ def required_roles_for_steps(selected_steps):
 
 def _normalize_step2_like_input(path):
     """Normalize a path to the corresponding step-2 '*-sl.fits' artifact."""
-    if not path:
-        return None
-    lower = path.lower()
-    if lower.endswith("-sl.fits"):
-        return path
-    if lower.endswith("-sl-f.fits"):
-        return path[:-7] + ".fits"
-    return stem(path) + "-sl.fits"
+    return normalize_step2_like_input(path)
 
 
 def expected_step2_outputs(quartz, thar, obj, twilight=None):
@@ -3161,24 +3616,44 @@ def expected_step2_outputs(quartz, thar, obj, twilight=None):
 
 def expected_master_flat(quartz_sl):
     """Return deterministic step-3 master-flat path."""
-    return stem(quartz_sl) + "_nflat.fits"
+    return step3_master_flat(quartz_sl)
 
 
 def expected_step4_outputs(thar_sl, obj_sl, twilight_sl=None):
     """Return deterministic step-4 output paths for all roles."""
     outputs = {
-        "thar_ff": stem(thar_sl) + "-F.fits",
-        "obj_ff": stem(obj_sl) + "-F.fits",
+        "thar_ff": step4_flat_corrected(thar_sl),
+        "obj_ff": step4_flat_corrected(obj_sl),
     }
     if twilight_sl:
-        outputs["twi_ff"] = stem(twilight_sl) + "-F.fits"
+        outputs["twi_ff"] = step4_flat_corrected(twilight_sl)
     return outputs
 
 
-def require_existing(path, requirement):
+def resolve_required_path(path, proc_dir=None):
+    """Resolve required-path existence, preferring cwd then proc_dir for bare tokens."""
+    if path is None:
+        return None
+
+    text = str(path)
+    if os.path.exists(text):
+        return text
+
+    if proc_dir and not os.path.isabs(text):
+        proc_candidate = os.path.join(proc_dir, text)
+        if os.path.exists(proc_candidate):
+            return proc_candidate
+
+    return None
+
+
+def require_existing(path, requirement, proc_dir=None):
     """Fail with a clear message if a required file is missing."""
-    if not os.path.exists(path):
-        raise RuntimeError(f"Missing required file for {requirement}: {path}")
+    resolved = resolve_required_path(path, proc_dir=proc_dir)
+    if resolved is None:
+        extra = f" (proc_dir={proc_dir})" if proc_dir else ""
+        raise RuntimeError(f"Missing required file for {requirement}: {path}{extra}")
+    return resolved
 
 
 def write_infiles_from_directory(input_dir, infiles_path=None, night=None, shoe=None, plate=None):
@@ -3785,7 +4260,6 @@ def quartz_trace_db_candidates(quartz):
         str(db_dir / f"ap._{base}"),  # Primary: IRAF's standard convention
         str(db_dir / f"ap.{base}"),   # Alternative without underscore
         str(db_dir / f"ap{base}"),    # Alternative without dot
-        base + ".db",                 # Legacy fallback
     ]
 
     # IRAF can encode full absolute input paths into ap* DB filenames.
@@ -3866,6 +4340,52 @@ def require_quartz_trace_db(quartz, requirement):
         f"Looked for: {', '.join(candidates)}. "
         "Run step 1 first for this quartz reference."
     )
+
+
+def select_quartz_trace_db_candidate(quartz, requirement, selection_cache=None):
+    """Select one existing quartz trace DB candidate for step2+ resume workflows."""
+    cache_key = quartz_reference_token(quartz)
+    if selection_cache is not None:
+        cached = selection_cache.get(cache_key)
+        if cached and os.path.exists(cached):
+            print(f"[quartz-db:{requirement}] reusing selected DB: {cached}")
+            return cached
+
+    candidates = quartz_trace_db_candidates(quartz)
+    existing = [p for p in candidates if os.path.exists(p)]
+
+    if not existing:
+        raise RuntimeError(
+            f"No existing quartz aperture trace database found for {requirement}. "
+            f"Expected IRAF token: {quartz_reference_token(quartz)}. "
+            f"Looked for: {', '.join(candidates)}. "
+            "Run step 1 first or provide/select a valid DB reference."
+        )
+
+    if len(existing) == 1:
+        chosen = existing[0]
+        print(f"[quartz-db:{requirement}] selected single DB: {chosen}")
+        if selection_cache is not None:
+            selection_cache[cache_key] = chosen
+        return chosen
+
+    if not _can_prompt_user():
+        raise RuntimeError(
+            "Multiple quartz aperture DB candidates found in non-interactive mode for "
+            f"{requirement}: {', '.join(existing)}"
+        )
+
+    print(f"\n[quartz-db:{requirement}] Multiple quartz trace DB candidates found:")
+    for idx, cand in enumerate(existing, start=1):
+        print(f"  [{idx}] {cand}")
+    idx = _prompt_numbered_menu("Select quartz DB candidate:", existing)
+    if idx is None:
+        raise RuntimeError("Quartz DB selection cancelled by user.")
+    chosen = existing[idx]
+    print(f"[quartz-db:{requirement}] selected DB: {chosen}")
+    if selection_cache is not None:
+        selection_cache[cache_key] = chosen
+    return chosen
 
 
 def infer_night_shoe(meta_by_role, reference_path=None, fallback_night=None, fallback_shoe=None):
@@ -4644,26 +5164,66 @@ def load_star_geometry_table(path):
 
 
 def star_order_by_distance_from_reference(star_geometry, ref_star, available_stars):
-    """Return stars ordered by increasing |y_star - y_ref| when geometry exists."""
-    if not star_geometry:
-        return sorted(available_stars)
+    """Return stars in bidirectional outward order around the reference star.
 
-    stars = star_geometry.get("stars", [])
+    When geometry is available, this alternates nearest neighbors above/below
+    the reference by signed y distance (above1, below1, above2, below2, ...).
+    If geometry is missing/incomplete, falls back to deterministic numeric order.
+    """
+    stars_sorted = sorted(int(s) for s in available_stars)
+    if ref_star not in stars_sorted:
+        return stars_sorted
+
+    if not star_geometry:
+        return stars_sorted
+
     y_by_star = {}
-    for rec in stars:
+    for rec in star_geometry.get("stars", []):
         try:
             y_by_star[int(rec["star_id"])] = float(rec["y_star"])
         except (KeyError, TypeError, ValueError):
             continue
 
     if ref_star not in y_by_star:
-        return sorted(available_stars)
+        return stars_sorted
 
     y_ref = y_by_star[ref_star]
-    with_y = [s for s in available_stars if s in y_by_star]
-    without_y = [s for s in available_stars if s not in y_by_star]
-    with_y_sorted = sorted(with_y, key=lambda s: (abs(y_by_star[s] - y_ref), s))
-    return with_y_sorted + sorted(without_y)
+    equal_y = []
+    above = []
+    below = []
+    without_y = []
+
+    for star in stars_sorted:
+        if star == ref_star:
+            continue
+        y_val = y_by_star.get(star)
+        if y_val is None:
+            without_y.append(star)
+            continue
+        dy = float(y_val - y_ref)
+        if dy < 0:
+            above.append((abs(dy), star))
+        elif dy > 0:
+            below.append((abs(dy), star))
+        else:
+            equal_y.append(star)
+
+    above.sort(key=lambda item: (item[0], item[1]))
+    below.sort(key=lambda item: (item[0], item[1]))
+    equal_y.sort()
+    without_y.sort()
+
+    ordered = [ref_star]
+    max_len = max(len(above), len(below))
+    for idx in range(max_len):
+        if idx < len(above):
+            ordered.append(above[idx][1])
+        if idx < len(below):
+            ordered.append(below[idx][1])
+
+    ordered.extend(equal_y)
+    ordered.extend(without_y)
+    return ordered
 
 
 def _expand_aperture_range_string(aperture_text):
@@ -5115,7 +5675,7 @@ def _prefer_crr2(path):
     if path.endswith("_ec-crr2.fits"):
         return path
     if path.endswith("_ec.fits"):
-        crr2 = stem(path) + "-crr2.fits"
+        crr2 = step7_crr2(path)
         if os.path.exists(crr2):
             return crr2
     return path
@@ -5219,6 +5779,105 @@ def reconstruct_star_outputs_from_disk(args):
         f"  Reconstructed {len(common_stars)} stars by scanning per-star extracted files in {args.input_dir}"
     )
     return obj_outputs, thar_outputs
+
+
+def retrofit_thar_reference_headers(proc_dir, night=None, shoe=None, plate=None, stars=None):
+    """Retrofit REFSPEC self-reference headers on existing extracted ThAr spectra."""
+    section_banner("Retrofit – stamp ThAr self-reference headers")
+    star_filter = set(int(s) for s in (stars or []))
+
+    candidates = sorted(glob.glob(os.path.join(proc_dir, "*_star*_ec*.fits")))
+    if not candidates:
+        print("  No extracted per-star spectra found; nothing to retrofit.")
+        return {
+            "checked": 0,
+            "updated": 0,
+            "already_ok": 0,
+            "skipped_no_db": 0,
+            "skipped_scope": 0,
+            "skipped_role": 0,
+            "skipped_star": 0,
+        }
+
+    summary = {
+        "checked": 0,
+        "updated": 0,
+        "already_ok": 0,
+        "skipped_no_db": 0,
+        "skipped_scope": 0,
+        "skipped_role": 0,
+        "skipped_star": 0,
+    }
+
+    for path in candidates:
+        lower_name = os.path.basename(path).lower()
+        if lower_name.endswith("-wl.fits"):
+            continue
+
+        star = _extract_star_number(path)
+        if star is None:
+            continue
+
+        if star_filter and star not in star_filter:
+            summary["skipped_star"] += 1
+            continue
+
+        meta = None
+        role = None
+        try:
+            meta = read_required_metadata(path)
+            role = classify_role(meta)
+        except Exception:
+            meta = None
+
+        if role != "thar" and not any(tag in lower_name for tag in ("thar", "lamp", "arc")):
+            summary["skipped_role"] += 1
+            continue
+
+        if meta is not None:
+            if night and str(meta.get("NIGHT", "")) != str(night):
+                summary["skipped_scope"] += 1
+                continue
+            if shoe and str(meta.get("SHOE", "")).upper() != str(shoe).upper():
+                summary["skipped_scope"] += 1
+                continue
+            if plate and str(meta.get("PLATE", "")).strip() != str(plate):
+                summary["skipped_scope"] += 1
+                continue
+
+        summary["checked"] += 1
+        found_db, db_candidates = resolve_existing_wavelength_db(path)
+        if not found_db:
+            summary["skipped_no_db"] += 1
+            print(
+                f"  [retrofit skip] star {star:02d}: no wavelength DB solution "
+                f"({', '.join(db_candidates)})"
+            )
+            continue
+
+        canonical_db = ensure_canonical_wavelength_db_entry(path, source_db=found_db)
+        if not canonical_db:
+            summary["skipped_no_db"] += 1
+            print(f"  [retrofit skip] star {star:02d}: canonical DB normalization failed")
+            continue
+
+        changed = mark_spectrum_as_reference(path, source_db=canonical_db)
+        if changed:
+            summary["updated"] += 1
+        else:
+            summary["already_ok"] += 1
+
+    print(
+        "  Retrofit summary: "
+        f"checked={summary['checked']}, "
+        f"updated={summary['updated']}, "
+        f"already_ok={summary['already_ok']}, "
+        f"skipped_no_db={summary['skipped_no_db']}, "
+        f"skipped_scope={summary['skipped_scope']}, "
+        f"skipped_role={summary['skipped_role']}, "
+        f"skipped_star={summary['skipped_star']}"
+    )
+    return summary
 
 
 def find_step2_outputs(input_dir, night, shoe, plate=None):
@@ -5344,6 +6003,20 @@ def main():
         sys.exit("ERROR: --step9-min-fit-frac must be within [0, 1].")
     if args.step9_max_rms < 0.0:
         sys.exit("ERROR: --step9-max-rms must be non-negative.")
+    if args.ref_star is not None and args.ref_star < 1:
+        sys.exit("ERROR: --ref-star must be a positive integer.")
+    if args.retrofit_only and not args.retrofit_thar_refspec:
+        sys.exit("ERROR: --retrofit-only requires --retrofit-thar-refspec.")
+    if args.retrofit_star:
+        bad_retrofit_stars = [s for s in args.retrofit_star if int(s) < 1]
+        if bad_retrofit_stars:
+            sys.exit("ERROR: --retrofit-star values must be positive integers.")
+
+    try:
+        step10_star_filter = parse_star_selection_csv(args.step10_stars, "--step10-stars")
+    except Exception as exc:
+        sys.exit(f"ERROR parsing --step10-stars: {exc}")
+    retrofit_star_filter = set(int(s) for s in (args.retrofit_star or []))
 
     try:
         selected_steps = selected_steps_from_args(args)
@@ -5367,6 +6040,22 @@ def main():
 
     if args.preprocess_only:
         print("  Preprocess-only run complete; exiting before echelle steps.")
+        return
+
+    if args.retrofit_thar_refspec:
+        try:
+            retrofit_thar_reference_headers(
+                proc_dir,
+                night=args.night,
+                shoe=args.shoe,
+                plate=args.plate,
+                stars=retrofit_star_filter,
+            )
+        except Exception as exc:
+            sys.exit(f"ERROR retrofitting ThAr REFSPEC headers: {exc}")
+
+    if args.retrofit_only:
+        print("  Retrofit-only run complete; exiting before echelle steps.")
         return
 
     try:
@@ -5472,6 +6161,32 @@ def main():
     state = {}
     obj_outputs = {}
     thar_outputs = {}
+    quartz_db_selection_cache = {}
+    state["quartz_trace_db_by_token"] = {}
+
+    # Keep Python/IRAF workdirs explicitly aligned before step execution.
+    try:
+        proc_dir = anchor_proc_workdir(proc_dir)
+    except Exception as exc:
+        sys.exit(f"ERROR re-anchoring proc working directory: {exc}")
+
+    def remember_quartz_trace_db_once(quartz_candidate, requirement):
+        """Remember quartz DB selection once per token for the current run."""
+        token = quartz_reference_token(quartz_candidate)
+        db_by_token = state.setdefault("quartz_trace_db_by_token", {})
+        remembered = db_by_token.get(token)
+        if remembered and os.path.exists(remembered):
+            state["quartz_trace_db"] = remembered
+            return remembered
+
+        selected = select_quartz_trace_db_candidate(
+            quartz_candidate,
+            requirement,
+            selection_cache=quartz_db_selection_cache,
+        )
+        db_by_token[token] = selected
+        state["quartz_trace_db"] = selected
+        return selected
     
     # ── 1. Trace apertures on quartz ─────────────────────────────────────────
     if 1 in selected_steps:
@@ -5492,8 +6207,13 @@ def main():
     elif any(s in selected_steps for s in (2, 6)):
         try:
             if 2 in selected_steps:
+                selected_db = remember_quartz_trace_db_once(
+                    quartz,
+                    "step 2",
+                )
                 step2_alias = ensure_quartz_trace_db_alias(quartz, quartz)
-                debug_quartz_trace_db_state(quartz, "step2-precheck", alias_result=step2_alias)
+                debug_quartz_trace_db_state(quartz, "step2-precheck", alias_result=step2_alias or selected_db)
+                state["quartz_trace_db"] = selected_db
                 require_quartz_trace_db(quartz, "step 2")
             if 6 in selected_steps:
                 if not quartz_ref:
@@ -5501,21 +6221,54 @@ def main():
                         "Step 6 requires a quartz trace reference. Provide --quartz "
                         "or --quartz-reference, or run steps 1-4 first."
                     )
+                selected_step6_db = remember_quartz_trace_db_once(
+                    quartz_ref,
+                    "step 6",
+                )
                 step6_pre_alias = ensure_quartz_trace_db_alias(quartz or quartz_ref, quartz_ref)
                 debug_quartz_trace_db_state(
                     quartz_ref,
                     "step6-early-precheck",
-                    alias_result=step6_pre_alias,
+                    alias_result=step6_pre_alias or selected_step6_db,
                 )
+                state["quartz_trace_db"] = selected_step6_db
                 require_quartz_trace_db(quartz_ref, "step 6")
         except Exception as exc:
             sys.exit(f"ERROR dependency check: {exc}")
 
     # ── 2. apscatter on all four images ──────────────────────────────────────
     if 2 in selected_steps:
+        try:
+            _step2_interactive_preflight(require_interactive=True)
+        except Exception as exc:
+            sys.exit(f"ERROR step 2 preflight: {exc}")
+
+        print(
+            "  [debug step2 entry] "
+            f"python_cwd={os.getcwd()} proc_dir={proc_dir}"
+        )
+
+        if getattr(args, "debug_step2_quartz_only", False):
+            try:
+                _debug_apscatter_quartz_only(quartz, proc_dir=proc_dir)
+            except Exception as exc:
+                sys.exit(f"ERROR step 2 quartz-only debug: {exc}")
+            return
+
         quartz_sl, thar_sl, obj_sl, twilight_sl = apscatter_all(
             quartz, thar, obj, twilight,
+            proc_dir=proc_dir,
         )
+
+        # Immediate validation so step-2 failures are surfaced at step 2.
+        try:
+            require_existing(quartz_sl, "step 2 output quartz-sl", proc_dir=proc_dir)
+            require_existing(thar_sl, "step 2 output thar-sl", proc_dir=proc_dir)
+            require_existing(obj_sl, "step 2 output object-sl", proc_dir=proc_dir)
+            require_existing(twilight_sl, "step 2 output twilight-sl", proc_dir=proc_dir)
+        except Exception as exc:
+            sys.exit(f"ERROR dependency check: {exc}")
+
         state.update({
             "quartz_sl": quartz_sl,
             "thar_sl": thar_sl,
@@ -5563,7 +6316,7 @@ def main():
                         f"Step 2 output for {key} is None (internal error). "
                         "Provide explicit base file flags (e.g., --quartz Quartz-...-sl.fits)."
                     )
-                require_existing(step2_expected[key], f"step 2 output ({key})")
+                require_existing(step2_expected[key], f"step 2 output ({key})", proc_dir=proc_dir)
                 state[key] = step2_expected[key]
         except Exception as exc:
             sys.exit(f"ERROR dependency check: {exc}")
@@ -5571,24 +6324,30 @@ def main():
     # ── 3. Normalised master flat ─────────────────────────────────────────────
     if 3 in selected_steps:
         try:
-            require_existing(state["quartz_sl"], "step 3 input quartz-sl")
+            step3_check_path = resolve_required_path(state["quartz_sl"], proc_dir=proc_dir)
+            print(
+                "  [debug step3 precheck] "
+                f"quartz_sl_token={state['quartz_sl']} "
+                f"resolved_path={step3_check_path if step3_check_path else '<missing>'}"
+            )
+            require_existing(state["quartz_sl"], "step 3 input quartz-sl", proc_dir=proc_dir)
         except Exception as exc:
             sys.exit(f"ERROR dependency check: {exc}")
         state["master_flat"] = make_normalised_flat(state["quartz_sl"])
     elif 4 in selected_steps:
         try:
             state["master_flat"] = expected_master_flat(state["quartz_sl"])
-            require_existing(state["master_flat"], "step 3 output master flat")
+            require_existing(state["master_flat"], "step 3 output master flat", proc_dir=proc_dir)
         except Exception as exc:
             sys.exit(f"ERROR dependency check: {exc}")
 
     # ── 4. Flat-field correction ──────────────────────────────────────────────
     if 4 in selected_steps:
         try:
-            require_existing(state["thar_sl"], "step 4 input thar-sl")
-            require_existing(state["obj_sl"], "step 4 input object-sl")
-            require_existing(state["twilight_sl"], "step 4 input twilight-sl")
-            require_existing(state["master_flat"], "step 4 input master flat")
+            require_existing(state["thar_sl"], "step 4 input thar-sl", proc_dir=proc_dir)
+            require_existing(state["obj_sl"], "step 4 input object-sl", proc_dir=proc_dir)
+            require_existing(state["twilight_sl"], "step 4 input twilight-sl", proc_dir=proc_dir)
+            require_existing(state["master_flat"], "step 4 input master flat", proc_dir=proc_dir)
         except Exception as exc:
             sys.exit(f"ERROR dependency check: {exc}")
 
@@ -5665,12 +6424,15 @@ def main():
         )
         preview_out = os.path.splitext(map_path)[0] + "_preview_map.txt"
 
-        centers, pattern = run_aperture_preview(
-            preview_quartz,
-            n_stars = args.nstars,
-            sep     = args.sep,
-            preview_out=preview_out,
-        )
+        try:
+            centers, pattern = run_aperture_preview(
+                preview_quartz,
+                n_stars = args.nstars,
+                sep     = args.sep,
+                preview_out=preview_out,
+            )
+        except Exception as exc:
+            sys.exit(f"ERROR step 5 preview: {exc}")
         state["pattern"] = pattern
         try:
             save_affiliation_map(map_path, pattern, preview_quartz, meta_by_role)
@@ -5811,9 +6573,9 @@ def main():
                             _ap_str_map[_s] = _aperture_range_string(
                                 list(np.where(_pat == _s)[0] + 1)
                             )
-                    _obj_ff = state.get("obj_ff", stem(obj or "") + "-sl-F.fits")
+                    _obj_ff = state.get("obj_ff", step4_flat_corrected(obj or ""))
                     obj_outputs = {
-                        _s: f"{stem(_obj_ff)}_star{_s:02d}_ec.fits"
+                        _s: step6_star_extract(_obj_ff, _s)
                         for _s in (_ap_str_map or {1: ""})
                     }
                     for _s, _p in obj_outputs.items():
@@ -5871,12 +6633,22 @@ def main():
                 "ERROR dependency check: step 8 requires ThAr extractions. "
                 "Run step 6 first or include it in the step range."
             )
+
+        try:
+            step8_mode_resolved, step8_reference_token = resolve_step8_runtime_config(
+                args.step8_mode,
+                args.step8_reference_thar,
+            )
+        except Exception as exc:
+            sys.exit(f"ERROR resolving step 8 runtime config: {exc}")
+
         ref_star = manual_wavelength_identification(
             crr2_outputs, thar_outputs,
             coordlist=args.coordlist,
-            step8_mode=args.step8_mode,
-            step8_reference_thar=args.step8_reference_thar,
+            step8_mode=step8_mode_resolved,
+            step8_reference_token=step8_reference_token,
             drift_log_path=drift_log_path,
+            explicit_ref_star=args.ref_star,
         )
         state["ref_star"] = ref_star
 
@@ -5890,8 +6662,24 @@ def main():
                 "ERROR dependency check: step 9 requires ThAr extractions. "
                 "Run step 6 first or include it in the step range."
             )
-        # Determine reference star: from step 8 if it ran, otherwise first star
-        ref_star = state.get("ref_star", min(crr2_outputs.keys()))
+        # Determine reference star: explicit CLI override, then step-8 state, then first available.
+        if args.ref_star is not None:
+            ref_star = int(args.ref_star)
+        else:
+            ref_star = state.get("ref_star", min(crr2_outputs.keys()))
+
+        if ref_star not in crr2_outputs:
+            available = ", ".join(f"{s:02d}" for s in sorted(crr2_outputs.keys()))
+            sys.exit(
+                f"ERROR: selected reference star {ref_star:02d} not found in CR-cleaned outputs. "
+                f"Available: {available}"
+            )
+        if ref_star not in thar_outputs:
+            available = ", ".join(f"{s:02d}" for s in sorted(thar_outputs.keys()))
+            sys.exit(
+                f"ERROR: selected reference star {ref_star:02d} not found in ThAr outputs. "
+                f"Available: {available}"
+            )
         step5_geometry_path = None
         extraction_pairs_path = None
 
@@ -5985,6 +6773,8 @@ def main():
             crr2_outputs,
             thar_outputs,
             skip_stars=state.get("step9_failed_gate_stars", []),
+            refspec_debug=args.step10_refspec_debug,
+            target_stars=step10_star_filter,
         )
         state["refspec_outputs"] = refspec_outputs
 
