@@ -5,17 +5,17 @@ This pipeline consists of two main scripts, `image_processing.py` and `reduce_ec
 `image_processing.py` handles preprocessing (bias and dark correction), image stitching, and stacking.
 
 `reduce_echelle.py` performs the echelle-specific processing steps:
-1.) Automatically identifies apertures and opens a preview for manual verification.
-2.) Scattered-light subtraction (interactive).
-3.) Master-flat creation.
-4.) Flat-field correction.
-5.) Review of extracted apertures. An interactive plot opens where the user can edit aperture assignments by either reassigning an aperture to a different star (key `[e]`) or deleting apertures (key `[d]`). After editing, apertures can be reassigned automatically with key `[f]`. The process is finalized and aperture information is saved by pressing key `[q]` twice.
-6.) Aperture extraction using the aperture IDs from the previous step.
-7.) Cosmic-ray removal on extracted apertures using the `lineclean` task.
-8.) Prompts the user to either identify lines manually or use a reference star for reidentification.
-9.) Carries line IDs from step 8 to other stars. The drift relative to the reference star along the CCD is extrapolated and logged. Each reidentified spectrum is then opened again in `ecid` for manual review and wavelength-solution refitting; manual line reidentification is also possible.
-10.) Creates a lamp reference for stellar images.
-11.) Dispersion correction.
+1. Automatically identifies apertures and opens a preview for manual verification.
+2. Scattered-light subtraction (interactive).
+3. Master-flat creation.
+4. Flat-field correction.
+5. Review of extracted apertures. An interactive plot opens where the user can edit aperture assignments by either reassigning an aperture to a different star (key `[e]`) or deleting apertures (key `[d]`). After editing, apertures can be reassigned automatically with key `[f]`. The process is finalized and aperture information is saved by pressing key `[q]` twice.
+6. Aperture extraction using the aperture IDs from the previous step.
+7. Cosmic-ray removal on extracted apertures using the `lineclean` task.
+8. Prompts the user to either identify lines manually or use a reference star for reidentification.
+9. Carries line IDs from step 8 to other stars. The drift relative to the reference star along the CCD is extrapolated and logged. Each reidentified spectrum is then opened again in `ecid` for manual review and wavelength-solution refitting; manual line reidentification is also possible.
+10. Creates a lamp reference for stellar images.
+11. Dispersion correction.
 
 Both scripts attempt to automatically classify images by exposure type and assign labels (`dark`, `quartz`, `twilight`, `fibermap`, `object`), while prompting the user when the label is ambiguous.
 
@@ -44,7 +44,7 @@ Useful optional flags:
 
 ### Two-stage run
 
-1.) Preprocess:
+1. Preprocess:
 
 ```bash
 python image_processing.py \
@@ -52,7 +52,7 @@ python image_processing.py \
 	--bias
 ```
 
-2.) Echelle reduction:
+2. Echelle reduction:
 
 ```bash
 python reduce_echelle.py \
