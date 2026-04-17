@@ -29,6 +29,8 @@ Pipeline steps
         – the pattern from step 5 is used to build one aperture list per star
         – for each star apall is called once for the object and once for the
           thar, extracting only that star's apertures
+                – each extracted object+ThAr pair is immediately renumbered to local
+                    apertures 1..N (normally 1..4)
         – outputs are named  <stem>_star<N>_ec.fits
   7.  Second cosmic-ray removal  (lineclean on extracted object spectra)
         – fits spline3 order=6 along the dispersion axis of each order
@@ -39,11 +41,12 @@ Pipeline steps
       a. choose mode for first (reference) star:
         - manual: ecidentify (interactive) on that star's ThAr
         - reuse : ecreidentify from an already identified ThAr reference
-    – The solution is saved/used in the IRAF database for steps 9-11
+            – The solution is built on the local apertures from step 6 and saved/used
+                in the IRAF database for steps 9-11
   9.  Automatic line-ID propagation + required review  (ecreidentify to remaining stars)
-      a. ecreidentify (automatic)   propagates line IDs from ref star to others
-      b. review      inspect reidentified ThAr line IDs (interactive when TTY)
-      c. transfer reviewed temp-target solution back to real target ThAr DB identity
+            a. ecreidentify (automatic)   propagates line IDs from ref star to others
+                 directly on each real target ThAr
+            b. review      inspect reidentified ThAr line IDs (interactive when TTY)
       – outputs: no new FITS files in this section
   10. refspec assignment to CR-cleaned object spectra
       – runs on *_ec-crr2.fits using reviewed real-target ThAr identities
@@ -173,8 +176,11 @@ def iraf_spec_token(path):
 
 
 def quartz_reference_token(reference_quartz):
-    """Return canonical IRAF apall references token for quartz traces."""
-    return f"./{stem(reference_quartz)}"
+    """Return canonical IRAF apall references token for quartz traces.
+
+    The leading dot keeps IRAF DB naming aligned with database/ap.<stem>.
+    """
+    return f".{stem(reference_quartz)}"
 
 
 def write_list(listpath, items):
@@ -1822,6 +1828,87 @@ def _lineclean_one(input_spec, output_spec):
         print(f"      lineclean: {input_spec}  ->  {output_spec}")
 
 
+def _step6_debug_report_path(obj_ff, thar_ff):
+    """Return deterministic Step-6 extraction debug report path."""
+    return f"step6_extraction_debug_{stem(obj_ff)}_{stem(thar_ff)}.json"
+
+
+def _step6_quartz_apertures_in_preview_order(quartz_path, expected_count):
+    """Return quartz DB aperture IDs in the same order used by preview."""
+    trace_details = _load_quartz_trace_details(quartz_path)
+    entries = sorted(
+        list(trace_details.get("entries", [])),
+        key=lambda entry: int(entry.get("aperture", 0)),
+    )
+    aperture_ids = [int(entry.get("aperture")) for entry in entries if entry.get("aperture") is not None]
+
+    if len(aperture_ids) < int(expected_count):
+        db_path = trace_details.get("db_path") or "<missing>"
+        raise RuntimeError(
+            "Step 6 preflight could not map dense pattern to quartz DB order: "
+            f"pattern has {int(expected_count)} apertures but quartz DB '{db_path}' "
+            f"has only {len(aperture_ids)} parsed aperture entries."
+        )
+
+    if len(aperture_ids) > int(expected_count):
+        aperture_ids = aperture_ids[: int(expected_count)]
+
+    return aperture_ids, (trace_details.get("db_path") or "")
+
+
+def _step6_focus_rows(star_rows, start_star=12, end_star=16):
+    """Return compact debug rows for a local star range."""
+    focus = []
+    for row in sorted(star_rows, key=lambda item: int(item.get("star", 0))):
+        star = int(row.get("star", 0))
+        if star < int(start_star) or star > int(end_star):
+            continue
+        focus.append(
+            {
+                "star": star,
+                "pattern_slots": list(row.get("pattern_slots", [])),
+                "dense_apertures": list(row.get("dense_apertures", [])),
+                "quartz_db_apertures": list(row.get("quartz_db_apertures", [])),
+                "aperture_str": str(row.get("aperture_str", "")),
+                "object_pre_renumber": list(row.get("object_pre_renumber", [])),
+                "thar_pre_renumber": list(row.get("thar_pre_renumber", [])),
+                "object_post_renumber": list(row.get("object_post_renumber", [])),
+                "thar_post_renumber": list(row.get("thar_post_renumber", [])),
+            }
+        )
+    return focus
+
+
+def _write_step6_debug_report(report_path, payload):
+    """Persist structured Step-6 extraction diagnostics."""
+    payload["focus_stars_12_16"] = _step6_focus_rows(payload.get("stars", []), 12, 16)
+    with open(report_path, "w") as fh:
+        json.dump(payload, fh, indent=2, sort_keys=True)
+
+
+def _print_step6_focus_report(payload, stage_label):
+    """Print compact stars-12..16 diagnostics to terminal."""
+    rows = payload.get("focus_stars_12_16") or _step6_focus_rows(payload.get("stars", []), 12, 16)
+    if not rows:
+        return
+
+    print(f"\n  Step 6 debug focus ({stage_label}) stars 12-16:")
+    for row in rows:
+        print(
+            "    star {star:02d} | slots={slots} | dense={dense} | quartz={quartz} | "
+            "obj_pre={obj_pre} | thar_pre={thar_pre} | obj_post={obj_post} | thar_post={thar_post}".format(
+                star=int(row.get("star", 0)),
+                slots=row.get("pattern_slots", []),
+                dense=row.get("dense_apertures", []),
+                quartz=row.get("quartz_db_apertures", []),
+                obj_pre=row.get("object_pre_renumber", []),
+                thar_pre=row.get("thar_pre_renumber", []),
+                obj_post=row.get("object_post_renumber", []),
+                thar_post=row.get("thar_post_renumber", []),
+            )
+        )
+
+
 def extract_all_stars(obj_ff, thar_ff, quartz, pattern):
     """
     For every unique star in *pattern*:
@@ -1829,7 +1916,9 @@ def extract_all_stars(obj_ff, thar_ff, quartz, pattern):
          string.
       2. Run apall on the flat-corrected object  -> <obj_stem>_star<N>_ec.fits
       3. Run apall on the flat-corrected thar    -> <thar_stem>_star<N>_ec.fits
-         using exactly the same aperture selection.
+            using exactly the same aperture selection.
+        4. Renumber both extracted outputs to local apertures 1..N so downstream
+            wavelength steps can match apertures directly.
 
     Object and thar are always extracted with the same aperture set so that
     wavelength calibration can later be applied aperture-for-aperture.
@@ -1848,6 +1937,70 @@ def extract_all_stars(obj_ff, thar_ff, quartz, pattern):
     obj_outputs  = {}
     thar_outputs = {}
 
+    debug_report_path = _step6_debug_report_path(obj_ff, thar_ff)
+    debug_payload = {
+        "schema_version": 1,
+        "obj_ff": str(obj_ff),
+        "thar_ff": str(thar_ff),
+        "quartz": str(quartz),
+        "pattern_length": int(len(pattern)),
+        "stars": [],
+    }
+
+    quartz_apertures_ordered, quartz_db_path = _step6_quartz_apertures_in_preview_order(
+        quartz,
+        expected_count=len(pattern),
+    )
+    debug_payload["quartz_db_path"] = str(quartz_db_path)
+    debug_payload["quartz_apertures_preview_order"] = [int(v) for v in quartz_apertures_ordered]
+
+    first_preflight_mismatch = None
+    star_debug_by_id = {}
+    for star in unique_stars:
+        slot_indices = np.where(pattern == star)[0]
+        pattern_slots = [int(v + 1) for v in slot_indices.tolist()]
+        dense_apertures = list(pattern_slots)
+        quartz_apertures = [int(quartz_apertures_ordered[idx]) for idx in slot_indices.tolist()]
+        aperture_str = _aperture_range_string(dense_apertures)
+
+        row = {
+            "star": int(star),
+            "pattern_slots": [int(v) for v in pattern_slots],
+            "dense_apertures": [int(v) for v in dense_apertures],
+            "quartz_db_apertures": [int(v) for v in quartz_apertures],
+            "aperture_str": str(aperture_str),
+            "object_pre_renumber": [],
+            "thar_pre_renumber": [],
+            "object_post_renumber": [],
+            "thar_post_renumber": [],
+        }
+        debug_payload["stars"].append(row)
+        star_debug_by_id[int(star)] = row
+
+        if first_preflight_mismatch is None and dense_apertures != quartz_apertures:
+            first_preflight_mismatch = {
+                "star": int(star),
+                "dense_apertures": [int(v) for v in dense_apertures],
+                "quartz_db_apertures": [int(v) for v in quartz_apertures],
+            }
+
+    if first_preflight_mismatch is not None:
+        debug_payload["error"] = (
+            "Step 6 preflight mismatch: dense pattern apertures differ from quartz DB preview order"
+        )
+        _write_step6_debug_report(debug_report_path, debug_payload)
+        _print_step6_focus_report(debug_payload, stage_label="preflight-mismatch")
+        star = int(first_preflight_mismatch["star"])
+        dense = first_preflight_mismatch["dense_apertures"]
+        quartz_ids = first_preflight_mismatch["quartz_db_apertures"]
+        raise RuntimeError(
+            "Step 6 preflight mismatch at star "
+            f"{star:02d}: dense pattern apertures {dense} != quartz DB apertures {quartz_ids}. "
+            f"Debug report: {debug_report_path}"
+        )
+
+    _write_step6_debug_report(debug_report_path, debug_payload)
+
     # Load IRAF packages for extraction.
     iraf.onedspec()
     iraf.noao()
@@ -1855,9 +2008,23 @@ def extract_all_stars(obj_ff, thar_ff, quartz, pattern):
     iraf.echelle()
 
     for star in unique_stars:
+        debug_row = star_debug_by_id[int(star)]
         # All 1-based aperture indices that belong to this star
         ap_indices   = list(np.where(pattern == star)[0] + 1)
         aperture_str = _aperture_range_string(ap_indices)
+
+        print(
+            f"\n  [step6-debug] star={int(star):02d} "
+            f"slots={debug_row['pattern_slots']} "
+            f"dense_apertures={debug_row['dense_apertures']} "
+            f"aperture_str='{aperture_str}'"
+        )
+        if int(star) == 14:
+            print(
+                "  [step6-debug star14] "
+                f"requested_dense={debug_row['dense_apertures']} "
+                f"quartz_db={debug_row['quartz_db_apertures']}"
+            )
 
         print(f"\n  -- Star {star:02d}  |  {len(ap_indices)} apertures  "
               f"|  IRAF range: {aperture_str}")
@@ -1867,14 +2034,92 @@ def extract_all_stars(obj_ff, thar_ff, quartz, pattern):
             obj_ff, quartz, aperture_str,
             star_number = star,
         )
-        obj_outputs[star] = obj_ec
+        obj_pre = _read_apertures_from_apnum_cards(obj_ec)
+        debug_row["object_pre_renumber"] = [int(v) for v in obj_pre]
+        print(
+            "    [step6-debug object pre] "
+            f"requested={debug_row['dense_apertures']} extracted={obj_pre} "
+            f"count={len(obj_pre)}/{len(ap_indices)}"
+        )
+        if len(obj_pre) != len(ap_indices):
+            debug_payload["error"] = (
+                f"Step 6 extraction mismatch for star {int(star):02d} (object): "
+                f"requested {debug_row['dense_apertures']} extracted {obj_pre}"
+            )
+            _write_step6_debug_report(debug_report_path, debug_payload)
+            _print_step6_focus_report(debug_payload, stage_label="object-pre-mismatch")
+            raise RuntimeError(
+                f"Step 6 extraction mismatch for star {int(star):02d}: "
+                f"requested {debug_row['dense_apertures']}, extracted {obj_pre}"
+            )
 
         print(f"    Extracting ThAr ...")
         thar_ec = _apall_extract_star(
             thar_ff, quartz, aperture_str,
             star_number = star,
         )
+        thar_pre = _read_apertures_from_apnum_cards(thar_ec)
+        debug_row["thar_pre_renumber"] = [int(v) for v in thar_pre]
+        print(
+            "    [step6-debug thar pre] "
+            f"requested={debug_row['dense_apertures']} extracted={thar_pre} "
+            f"count={len(thar_pre)}/{len(ap_indices)}"
+        )
+        if len(thar_pre) != len(ap_indices):
+            debug_payload["error"] = (
+                f"Step 6 extraction mismatch for star {int(star):02d} (thar): "
+                f"requested {debug_row['dense_apertures']} extracted {thar_pre}"
+            )
+            _write_step6_debug_report(debug_report_path, debug_payload)
+            _print_step6_focus_report(debug_payload, stage_label="thar-pre-mismatch")
+            raise RuntimeError(
+                f"Step 6 extraction mismatch for star {int(star):02d}: "
+                f"requested {debug_row['dense_apertures']}, extracted {thar_pre}"
+            )
+
+        local_mapping = _build_local_aperture_mapping(ap_indices)
+        print(f"    local apertures   : {_format_aperture_mapping(local_mapping)}")
+        _renumber_multispec_fits_apertures(obj_ec, local_mapping)
+        _renumber_multispec_fits_apertures(thar_ec, local_mapping)
+
+        obj_post = _read_apertures_from_apnum_cards(obj_ec)
+        thar_post = _read_apertures_from_apnum_cards(thar_ec)
+        debug_row["object_post_renumber"] = [int(v) for v in obj_post]
+        debug_row["thar_post_renumber"] = [int(v) for v in thar_post]
+
+        expected_obj_local = list(range(1, len(obj_pre) + 1))
+        expected_thar_local = list(range(1, len(thar_pre) + 1))
+        if obj_post != expected_obj_local:
+            debug_payload["error"] = (
+                f"Step 6 renumber mismatch for star {int(star):02d} (object): "
+                f"pre {obj_pre} post {obj_post}"
+            )
+            _write_step6_debug_report(debug_report_path, debug_payload)
+            _print_step6_focus_report(debug_payload, stage_label="object-post-mismatch")
+            raise RuntimeError(
+                f"Step 6 renumber mismatch for star {int(star):02d} (object): "
+                f"pre {obj_pre}, post {obj_post}"
+            )
+        if thar_post != expected_thar_local:
+            debug_payload["error"] = (
+                f"Step 6 renumber mismatch for star {int(star):02d} (thar): "
+                f"pre {thar_pre} post {thar_post}"
+            )
+            _write_step6_debug_report(debug_report_path, debug_payload)
+            _print_step6_focus_report(debug_payload, stage_label="thar-post-mismatch")
+            raise RuntimeError(
+                f"Step 6 renumber mismatch for star {int(star):02d} (thar): "
+                f"pre {thar_pre}, post {thar_post}"
+            )
+
+        _write_step6_debug_report(debug_report_path, debug_payload)
+
+        obj_outputs[star] = obj_ec
         thar_outputs[star] = thar_ec
+
+    _write_step6_debug_report(debug_report_path, debug_payload)
+    _print_step6_focus_report(debug_payload, stage_label="final")
+    print(f"  Step 6 debug report : {debug_report_path}")
 
     return obj_outputs, thar_outputs
 
@@ -2237,7 +2482,7 @@ def ensure_wavelength_db_aliases(thar_path, source_db):
     return ensure_canonical_wavelength_db_entry(thar_path, source_db=source_db)
 
 
-def normalize_ec_database_records(db_path, canonical_root, aperture_mapping=None):
+def normalize_ec_database_records(db_path, canonical_root):
     """Normalize wavelength DB record identity fields to canonical bare-root token."""
     if not db_path or not os.path.exists(db_path):
         return False
@@ -2259,10 +2504,9 @@ def normalize_ec_database_records(db_path, canonical_root, aperture_mapping=None
         m_begin_ap = re.match(r"^(\s*begin\s+\S+\s+)(\S+)(\s+)(-?\d+)(\s*)$", raw)
         if m_begin_ap:
             old_ap = int(m_begin_ap.group(4))
-            new_ap = aperture_mapping.get(old_ap, old_ap) if aperture_mapping else old_ap
             new_line = (
                 f"{m_begin_ap.group(1)}{canonical_token}{m_begin_ap.group(3)}"
-                f"{new_ap}{m_begin_ap.group(5)}{newline}"
+                f"{old_ap}{m_begin_ap.group(5)}{newline}"
             )
             rewritten.append(new_line)
             if new_line != line:
@@ -2288,16 +2532,6 @@ def normalize_ec_database_records(db_path, canonical_root, aperture_mapping=None
         m_id = re.match(r"^(\s*id\s+)(\S+)(\s*)$", raw)
         if m_id:
             new_line = f"{m_id.group(1)}{canonical_token}{m_id.group(3)}{newline}"
-            rewritten.append(new_line)
-            if new_line != line:
-                changed = True
-            continue
-
-        m_ap = re.match(r"^(\s*aperture\s+)(-?\d+)(\s*)$", raw)
-        if m_ap and aperture_mapping:
-            old_ap = int(m_ap.group(2))
-            new_ap = aperture_mapping.get(old_ap, old_ap)
-            new_line = f"{m_ap.group(1)}{new_ap}{m_ap.group(3)}{newline}"
             rewritten.append(new_line)
             if new_line != line:
                 changed = True
@@ -2364,8 +2598,8 @@ def _refspec_one(obj_ec, thar_ec, debug=False):
     spectrum *obj_ec* using refspec.
 
     select=match means IRAF pairs apertures by number (1→1, 2→2, …), which
-    is correct because object and ThAr were extracted from the same aperture
-    set in step 6.
+    is correct because step 6 permanently renumbers each object+ThAr pair to
+    the same local aperture IDs.
     """
     obj_iraf = os.path.basename(str(obj_ec).split("[", 1)[0])
     ref_iraf = os.path.basename(str(thar_ec).split("[", 1)[0])
@@ -2641,29 +2875,23 @@ def auto_wavelength_propagation(crr2_outputs, thar_outputs, ref_star,
                                 step9_min_found_frac=0.05,
                                 step9_min_fit_frac=0.05,
                                 step9_max_rms=0.30,
-                                star_geometry=None,
-                                step5_geometry_path=None,
-                                extraction_pairs_path=None):
+                                star_geometry=None):
     """Step 9: automatic line-ID propagation and required review for non-reference stars."""
-    section_banner("Step 9 – Automatic line-ID propagation (ecreidentify + review + transfer-back)")
+    section_banner("Step 9 – Automatic line-ID propagation (ecreidentify + review)")
     iraf.noao()
     iraf.echelle()
     iraf.onedspec()
 
     thar_ec_ref = thar_outputs[ref_star]
-    master_ref_apertures = _read_apertures_from_apnum_cards(thar_ec_ref)
-    if not master_ref_apertures:
-        raise RuntimeError(
-            f"Could not read APNUM apertures from master reference ThAr: {thar_ec_ref}"
-        )
+    _assert_local_apertures(thar_ec_ref, expected_count=4)
 
     reviewed_thar_outputs = {}
     failed_gate_stars = []
 
     if step9_gate_mode != "off":
-        gate_action = "warn-only (continue review/transfer-back)"
+        gate_action = "warn-only (continue review on failures)"
         if step9_gate_mode == "strict":
-            gate_action = "strict (skip review/transfer-back on failure)"
+            gate_action = "strict (skip review on failure)"
         print(
             "  Step 9 gate: "
             f"mode={step9_gate_mode}, "
@@ -2697,89 +2925,45 @@ def auto_wavelength_propagation(crr2_outputs, thar_outputs, ref_star,
             print("     (reference star — solution from step 8)")
             reviewed_thar_outputs[star] = thar_ec
         else:
-            target_apertures, aperture_source = get_target_aperture_numbers(
-                star,
-                thar_ec,
-                geometry_path=step5_geometry_path,
-                extraction_pairs_path=extraction_pairs_path,
-            )
-            print(f"     real target file : {os.path.basename(thar_ec)}")
-            print(f"     target apertures : {target_apertures} (source={aperture_source})")
-            print(f"     master apertures : {master_ref_apertures}")
-
-            prep = None
+            _assert_local_apertures(thar_ec, expected_count=4)
             gate_failed = False
-            try:
-                prep = _prepare_temp_target_for_reidentify(
-                    thar_ec_ref,
-                    thar_ec,
-                    star,
-                    target_apertures,
-                )
-                print(f"     temp target file : {prep['temp_target_path']}")
-                print(
-                    "     target->master   : "
-                    f"{_format_aperture_mapping(prep['target_to_master'])}"
-                )
+            print("     ecreidentify on real target")
+            metrics = _ecreidentify_thar(
+                thar_ec,
+                thar_ec_ref,
+                drift_log_path=drift_log_path,
+                drift_stage="step9_propagation",
+            )
+            print("     ecreidentify     : complete")
 
-                metrics = _ecreidentify_thar(
-                    prep["temp_target_path"],
-                    thar_ec_ref,
-                    drift_log_path=drift_log_path,
-                    drift_stage="step9_propagation",
+            if step9_gate_mode != "off":
+                gate_ok, failures = evaluate_reidentify_quality(
+                    metrics,
+                    min_found_frac=step9_min_found_frac,
+                    min_fit_frac=step9_min_fit_frac,
+                    max_rms=step9_max_rms,
                 )
-                print("     ecreidentify     : complete")
-
-                if step9_gate_mode != "off":
-                    gate_ok, failures = evaluate_reidentify_quality(
-                        metrics,
-                        min_found_frac=step9_min_found_frac,
-                        min_fit_frac=step9_min_fit_frac,
-                        max_rms=step9_max_rms,
-                    )
-                    if gate_ok:
-                        print("     gate: PASS")
+                if gate_ok:
+                    print("     gate: PASS")
+                else:
+                    failure_text = "; ".join(failures)
+                    print(f"     gate: FAIL ({failure_text})")
+                    if step9_gate_mode == "strict":
+                        print("     gate action: strict -> skipping review on this star")
+                        failed_gate_stars.append(star)
+                        gate_failed = True
                     else:
-                        failure_text = "; ".join(failures)
-                        print(f"     gate: FAIL ({failure_text})")
-                        if step9_gate_mode == "strict":
-                            print("     gate action: strict -> skipping review/transfer-back for this star")
-                            failed_gate_stars.append(star)
-                            gate_failed = True
-                        else:
-                            print("     gate action: warn -> continuing to review/transfer-back")
+                        print("     gate action: warn -> continuing to review")
 
-                if not gate_failed:
-                    print("     review start     : ecidentify on temporary target")
-                    _review_reidentified_lines(prep["temp_target_path"], coordlist=coordlist)
-                    print("     review end       : ecidentify complete")
-
-                    print("     db transfer start: temporary target -> real target identity")
-                    transfer = _transfer_reviewed_temp_target_solution_to_real_target(
-                        prep["temp_target_path"],
-                        thar_ec,
-                        prep["master_to_target"],
-                    )
-                    print(
-                        "     db transfer end  : "
-                        f"{os.path.basename(transfer['temp_db_path'])} -> "
-                        f"{os.path.basename(transfer['real_db_path'])}"
-                    )
-                    try:
-                        mark_spectrum_as_reference(thar_ec)
-                    except Exception as exc:
-                        print(f"     [warn] self-reference stamp failed for real target ThAr: {exc}")
-                    reviewed_thar_outputs[star] = thar_ec
-            finally:
-                if prep is not None:
-                    removed, failed = _cleanup_temporary_reference_artifacts(
-                        prep["temp_target_path"],
-                        prep["cleanup_db_candidates"],
-                    )
-                    if failed:
-                        print(f"     cleanup status   : WARN ({'; '.join(failed)})")
-                    else:
-                        print(f"     cleanup status   : OK ({len(removed)} temporary files removed)")
+            if not gate_failed:
+                print("     review on real target")
+                _review_reidentified_lines(thar_ec, coordlist=coordlist)
+                try:
+                    mark_spectrum_as_reference(thar_ec)
+                except Exception as exc:
+                    print(f"     [warn] self-reference stamp failed for real target ThAr: {exc}")
+                print("     reviewed real target DB ready")
+                reviewed_thar_outputs[star] = thar_ec
 
             if gate_failed:
                 continue
@@ -3368,7 +3552,7 @@ def parse_args():
               6. Per-star extraction with accepted pattern  ->  *_starNN_ec.fits
               7. Second CR removal (lineclean)  ->  *_ec-crr2.fits
               8. Reference-star wavelength setup (manual/reuse)
-              9. Automatic wavelength propagation + review + transfer-back
+                            9. Automatic wavelength propagation + required review
              10. Refspec assignment to CR-cleaned object spectra
              11. Dispcor wavelength linearization  ->  *_ec-crr2-dc.fits
         """),
@@ -3478,7 +3662,7 @@ def parse_args():
         choices=["off", "warn", "strict"],
         help=(
             "Step-9 quality gate behavior: off (disabled), warn (report failures), "
-            "strict (skip review/transfer-back for failed stars)."
+            "strict (skip review for failed stars)."
         ),
     )
     p.add_argument(
@@ -4095,72 +4279,179 @@ def _trace_source_from_step2_like(quartz_path):
 
 
 def ensure_quartz_trace_db_alias(source_quartz, alias_quartz):
-    """Ensure alias quartz has aperture DB with alias-consistent image identity."""
-    alias_candidates = quartz_trace_db_candidates(alias_quartz)
-    existing_alias = [p for p in alias_candidates if os.path.exists(p)]
+    """Deprecated in canonical-only mode; return canonical DB path when present."""
+    _ = source_quartz
+    canonical = _canonical_quartz_trace_db_path(alias_quartz)
+    if canonical and os.path.exists(canonical):
+        return canonical
+    return None
+
+
+def _canonical_quartz_trace_db_path(quartz):
+    """Return canonical quartz aperture DB path: database/ap.<stem(quartz)>."""
+    if quartz is None:
+        return None
+    quartz_text = str(quartz).strip().split("[", 1)[0]
+    quartz_dir = os.path.dirname(quartz_text)
+    base = stem(os.path.basename(quartz_text))
+    if quartz_dir:
+        return os.path.join(quartz_dir, "database", f"ap.{base}")
+    return os.path.join("database", f"ap.{base}")
+
+
+def _legacy_quartz_trace_db_candidates(quartz):
+    """Return legacy quartz DB filename variants for one-time migration/cleanup."""
+    if quartz is None:
+        return []
+
+    quartz_text = str(quartz).strip().split("[", 1)[0]
+    quartz_dir = os.path.dirname(quartz_text)
+    base = stem(os.path.basename(quartz_text))
+
+    def _db_join(name):
+        if quartz_dir:
+            return os.path.join(quartz_dir, "database", name)
+        return os.path.join("database", name)
+
+    candidates = [
+        _db_join(f"ap._{base}"),
+        _db_join(f"ap{base}"),
+    ]
+
+    for probe in (quartz_text, os.path.abspath(quartz_text)):
+        root = os.path.splitext(probe)[0]
+        token = root.replace("\\", "_").replace("/", "_")
+        if token:
+            candidates.append(_db_join(f"ap{token}"))
+
+    unique = []
+    seen = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        unique.append(candidate)
+    return unique
+
+
+def renumber_quartz_trace_db_apertures_sequential(quartz):
+    """Normalize quartz aperture DB to canonical file and sequential aperture IDs."""
+    canonical_db = _canonical_quartz_trace_db_path(quartz)
+    if not canonical_db:
+        raise RuntimeError("Cannot resolve canonical quartz DB path (missing quartz reference).")
+    canonical_token = quartz_reference_token(quartz)
+
+    os.makedirs(os.path.dirname(canonical_db) or ".", exist_ok=True)
 
     source_db = None
-    for candidate in quartz_trace_db_candidates(source_quartz):
-        if os.path.exists(candidate):
-            source_db = candidate
-            break
-
-    if source_db is None:
-        traced_source = _trace_source_from_step2_like(source_quartz)
-        if traced_source:
-            for candidate in quartz_trace_db_candidates(traced_source):
-                if os.path.exists(candidate):
-                    source_db = candidate
-                    break
-
-    # Resume runs often pass --quartz as '*-sl.fits' (which has no trace DB).
-    # Fall back to any existing alias/source trace DB and normalize identity.
-    if source_db is None:
-        for candidate in quartz_trace_db_candidates(alias_quartz):
+    if os.path.exists(canonical_db):
+        source_db = canonical_db
+    else:
+        for candidate in _legacy_quartz_trace_db_candidates(quartz):
             if os.path.exists(candidate):
                 source_db = candidate
                 break
-    if source_db is None and existing_alias:
-        source_db = existing_alias[0]
+
     if source_db is None:
-        return None
+        raise RuntimeError(
+            "Step 1 postprocess could not find quartz aperture DB to renumber. "
+            f"Expected canonical path: {canonical_db}"
+        )
 
-    template_db = source_db
-    if os.path.abspath(source_db) in {os.path.abspath(p) for p in alias_candidates if os.path.lexists(p)}:
-        template_db = os.path.join("database", f"._ap_source_{stem(alias_quartz)}.tmp")
-        shutil.copy2(source_db, template_db)
+    if os.path.abspath(source_db) != os.path.abspath(canonical_db):
+        shutil.copy2(source_db, canonical_db)
 
-    os.makedirs("database", exist_ok=True)
+    with open(canonical_db, "r") as fh:
+        lines = fh.readlines()
 
-    # Ensure all common IRAF DB naming variants exist for the alias and point
-    # to alias image identity (IRAF checks DB image tags during extraction).
-    for target in alias_candidates:
-        if os.path.exists(target) and os.path.islink(target):
-            os.unlink(target)
+    begin_pattern = re.compile(r"^(\s*begin\s+aperture\s+)(\S+)(\s+)(-?\d+)(\s*.*)$")
+    image_pattern = re.compile(r"^(\s*image\s+)(\S+)(\s*)$")
+    old_ids = []
+    for line in lines:
+        raw = line.rstrip("\n")
+        m_begin = begin_pattern.match(raw)
+        if not m_begin:
+            continue
+        old_ids.append(int(m_begin.group(4)))
 
-        needs_refresh = (not os.path.exists(target))
-        if not needs_refresh:
+    if not old_ids:
+        raise RuntimeError(
+            f"Step 1 postprocess found no aperture blocks in quartz DB: {canonical_db}"
+        )
+
+    old_to_new = {}
+    for old_ap in old_ids:
+        if old_ap not in old_to_new:
+            old_to_new[old_ap] = len(old_to_new) + 1
+
+    rewritten = []
+    changed = False
+    for line in lines:
+        raw = line.rstrip("\n")
+        newline = "\n" if line.endswith("\n") else ""
+
+        m_begin = begin_pattern.match(raw)
+        if m_begin:
+            old_ap = int(m_begin.group(4))
+            new_ap = old_to_new.get(old_ap, old_ap)
+            new_line = (
+                f"{m_begin.group(1)}{canonical_token}{m_begin.group(3)}"
+                f"{new_ap}{m_begin.group(5)}{newline}"
+            )
+            rewritten.append(new_line)
+            if new_line != line:
+                changed = True
+            continue
+
+        m_image = image_pattern.match(raw)
+        if m_image:
+            new_line = f"{m_image.group(1)}{canonical_token}{m_image.group(3)}{newline}"
+            rewritten.append(new_line)
+            if new_line != line:
+                changed = True
+            continue
+
+        m_ap = re.match(r"^(\s*aperture\s+)(-?\d+)(\s*)$", raw)
+        if m_ap:
+            old_ap = int(m_ap.group(2))
+            new_ap = old_to_new.get(old_ap, old_ap)
+            new_line = f"{m_ap.group(1)}{new_ap}{m_ap.group(3)}{newline}"
+            rewritten.append(new_line)
+            if new_line != line:
+                changed = True
+            continue
+
+        m_beam = re.match(r"^(\s*beam\s+)(-?\d+)(\s*)$", raw)
+        if m_beam:
+            old_ap = int(m_beam.group(2))
+            new_ap = old_to_new.get(old_ap, old_ap)
+            new_line = f"{m_beam.group(1)}{new_ap}{m_beam.group(3)}{newline}"
+            rewritten.append(new_line)
+            if new_line != line:
+                changed = True
+            continue
+
+        rewritten.append(line)
+
+    if changed:
+        with open(canonical_db, "w") as fh:
+            fh.writelines(rewritten)
+
+    for legacy in _legacy_quartz_trace_db_candidates(quartz):
+        if os.path.abspath(legacy) == os.path.abspath(canonical_db):
+            continue
+        if os.path.exists(legacy):
             try:
-                needs_refresh = os.path.getmtime(source_db) > os.path.getmtime(target)
+                os.remove(legacy)
             except OSError:
-                needs_refresh = True
+                pass
 
-        if needs_refresh:
-            shutil.copy2(template_db, target)
-
-        rewrite_quartz_db_image_identity(target, alias_quartz)
-
-    if template_db != source_db and os.path.exists(template_db):
-        os.remove(template_db)
-
-    # Return the preferred candidate if present, otherwise any existing alias.
-    for target in alias_candidates:
-        if os.path.exists(target):
-            return target
-    for target in existing_alias:
-        if os.path.exists(target):
-            return target
-    return None
+    new_ids = list(range(1, len(old_to_new) + 1))
+    print(
+        "  Renumbered quartz DB apertures sequentially: "
+        f"old_ids={old_ids} -> new_ids={new_ids}"
+    )
+    return canonical_db
 
 
 def canonical_wavelength_db_path(thar_path, db_dir="./database"):
@@ -4247,46 +4538,12 @@ def ensure_canonical_wavelength_db_entry(thar_path_or_token, source_db=None):
 
 
 def quartz_trace_db_candidates(quartz):
-    """Return likely IRAF aperture database paths for a quartz reference."""
-    from pathlib import Path
-    if quartz is None:
-        return []  # No candidates if no quartz provided
-
-    quartz_text = str(quartz).strip().split("[", 1)[0]
-    base = stem(quartz_text)
-    db_dir = Path("database")
-
-    candidates = [
-        str(db_dir / f"ap._{base}"),  # Primary: IRAF's standard convention
-        str(db_dir / f"ap.{base}"),   # Alternative without underscore
-        str(db_dir / f"ap{base}"),    # Alternative without dot
-    ]
-
-    # IRAF can encode full absolute input paths into ap* DB filenames.
-    # Example: /home/user/proc/quartz.fits -> database/ap_home_user_proc_quartz
-    raw_tokens = []
-    for probe in (quartz_text, os.path.abspath(quartz_text)):
-        if not probe:
-            continue
-        root = os.path.splitext(probe)[0]
-        token = root.replace("\\", "_").replace("/", "_")
-        if token:
-            raw_tokens.append(token)
-
-    for token in raw_tokens:
-        candidates.append(str(db_dir / f"ap{token}"))
-
-    unique = []
-    seen = set()
-    for candidate in candidates:
-        if candidate in seen:
-            continue
-        seen.add(candidate)
-        unique.append(candidate)
-    return unique
+    """Return canonical IRAF quartz aperture DB path only."""
+    canonical = _canonical_quartz_trace_db_path(quartz)
+    return [canonical] if canonical else []
 
 
-def debug_quartz_trace_db_state(quartz, context, alias_result=None):
+def debug_quartz_trace_db_state(quartz, context):
     """Emit concise quartz DB diagnostics for dependency checks."""
     if quartz is None:
         print(f"[quartz-db:{context}] quartz=<none>")
@@ -4296,8 +4553,7 @@ def debug_quartz_trace_db_state(quartz, context, alias_result=None):
     candidates = quartz_trace_db_candidates(quartz)
     existing = [p for p in candidates if os.path.exists(p)]
     print(
-        f"[quartz-db:{context}] quartz={quartz} expected_token={expected} "
-        f"alias_db={alias_result if alias_result else '<none>'}"
+        f"[quartz-db:{context}] quartz={quartz} expected_token={expected}"
     )
     if existing:
         print(f"[quartz-db:{context}] db_candidates_found={', '.join(existing)}")
@@ -4312,13 +4568,6 @@ def require_quartz_trace_db(quartz, requirement):
             f"Missing quartz reference file for {requirement}. "
             "Provide --quartz <quartz_file> or run steps 1-4 first."
         )
-
-    # Normalize DB identity for the exact reference token used by later apall calls.
-    try:
-        ensure_quartz_trace_db_alias(quartz, quartz)
-    except Exception:
-        # Keep dependency checks robust even if normalization cannot run yet.
-        pass
 
     candidates = quartz_trace_db_candidates(quartz)
     existing = [p for p in candidates if os.path.exists(p)]
@@ -4343,14 +4592,8 @@ def require_quartz_trace_db(quartz, requirement):
 
 
 def select_quartz_trace_db_candidate(quartz, requirement, selection_cache=None):
-    """Select one existing quartz trace DB candidate for step2+ resume workflows."""
-    cache_key = quartz_reference_token(quartz)
-    if selection_cache is not None:
-        cached = selection_cache.get(cache_key)
-        if cached and os.path.exists(cached):
-            print(f"[quartz-db:{requirement}] reusing selected DB: {cached}")
-            return cached
-
+    """Return canonical quartz trace DB path for step2+ resume workflows."""
+    _ = selection_cache
     candidates = quartz_trace_db_candidates(quartz)
     existing = [p for p in candidates if os.path.exists(p)]
 
@@ -4362,29 +4605,8 @@ def select_quartz_trace_db_candidate(quartz, requirement, selection_cache=None):
             "Run step 1 first or provide/select a valid DB reference."
         )
 
-    if len(existing) == 1:
-        chosen = existing[0]
-        print(f"[quartz-db:{requirement}] selected single DB: {chosen}")
-        if selection_cache is not None:
-            selection_cache[cache_key] = chosen
-        return chosen
-
-    if not _can_prompt_user():
-        raise RuntimeError(
-            "Multiple quartz aperture DB candidates found in non-interactive mode for "
-            f"{requirement}: {', '.join(existing)}"
-        )
-
-    print(f"\n[quartz-db:{requirement}] Multiple quartz trace DB candidates found:")
-    for idx, cand in enumerate(existing, start=1):
-        print(f"  [{idx}] {cand}")
-    idx = _prompt_numbered_menu("Select quartz DB candidate:", existing)
-    if idx is None:
-        raise RuntimeError("Quartz DB selection cancelled by user.")
-    chosen = existing[idx]
-    print(f"[quartz-db:{requirement}] selected DB: {chosen}")
-    if selection_cache is not None:
-        selection_cache[cache_key] = chosen
+    chosen = existing[0]
+    print(f"[quartz-db:{requirement}] selected canonical DB: {chosen}")
     return chosen
 
 
@@ -4775,7 +4997,16 @@ def save_step5_geometry(path, centers, pattern, quartz_path, meta_by_role):
     pattern = np.asarray(pattern, dtype=int)
 
     trace_details = _load_quartz_trace_details(quartz_path)
-    by_ap = {entry["aperture"]: entry for entry in trace_details["entries"]}
+    # Keep trace ordering consistent with aperture_preview.load_iraf_traces,
+    # which sorts parsed DB entries by aperture number and then trims/pads to nap.
+    ordered_traces = sorted(
+        list(trace_details.get("entries", [])),
+        key=lambda entry: int(entry.get("aperture", 0)),
+    )
+    if len(ordered_traces) > len(pattern):
+        ordered_traces = ordered_traces[: len(pattern)]
+    elif len(ordered_traces) < len(pattern):
+        ordered_traces.extend({} for _ in range(len(pattern) - len(ordered_traces)))
 
     order_index_by_ap = {}
     for star in sorted(set(int(s) for s in pattern if int(s) > 0)):
@@ -4797,12 +5028,13 @@ def save_step5_geometry(path, centers, pattern, quartz_path, meta_by_role):
                 gap_next[ap_i] = float(deltas[pos])
 
     aperture_records = []
-    for ap_idx in range(len(pattern)):
+    for ap_idx, (center_y, star_value, trace) in enumerate(
+        zip(centers, pattern, ordered_traces)
+    ):
         aperture = ap_idx + 1
-        star = int(pattern[ap_idx])
+        star = int(star_value)
         bundle = ((star - 1) // 4 + 1) if star > 0 else None
         star_in_bundle = ((star - 1) % 4 + 1) if star > 0 else None
-        trace = by_ap.get(aperture, {})
 
         aperture_records.append(
             {
@@ -4811,7 +5043,7 @@ def save_step5_geometry(path, centers, pattern, quartz_path, meta_by_role):
                 "star": star if star > 0 else None,
                 "star_in_bundle": star_in_bundle,
                 "order": order_index_by_ap.get(aperture),
-                "y_center_ref": float(centers[ap_idx]),
+                "y_center_ref": float(center_y),
                 "trace_coeffs": trace.get("trace_coeffs"),
                 "lower": trace.get("lower"),
                 "upper": trace.get("upper"),
@@ -5226,36 +5458,6 @@ def star_order_by_distance_from_reference(star_geometry, ref_star, available_sta
     return ordered
 
 
-def _expand_aperture_range_string(aperture_text):
-    """Expand compact aperture ranges like '1-3,8' to sorted integer list."""
-    result = []
-    text = str(aperture_text or "").strip()
-    if not text:
-        return result
-
-    for chunk in text.split(","):
-        token = chunk.strip()
-        if not token:
-            continue
-        if "-" in token:
-            try:
-                left, right = token.split("-", 1)
-                lo = int(left.strip())
-                hi = int(right.strip())
-            except ValueError:
-                continue
-            if lo <= hi:
-                result.extend(range(lo, hi + 1))
-            else:
-                result.extend(range(hi, lo + 1))
-        else:
-            try:
-                result.append(int(token))
-            except ValueError:
-                continue
-    return sorted(set(result))
-
-
 def _first_int_in_text(value):
     """Return first integer token found in value, otherwise None."""
     m = re.search(r"[-+]?\d+", str(value))
@@ -5273,49 +5475,26 @@ def _replace_first_integer(value, new_int):
     return text[:m.start()] + str(int(new_int)) + text[m.end():]
 
 
-def _read_apertures_from_geometry_file(geometry_path, target_star):
-    """Read target star aperture numbers from persisted step-5 geometry."""
-    if not geometry_path or not os.path.exists(geometry_path):
-        return []
+def _build_local_aperture_mapping(ap_indices):
+    """Map extracted aperture IDs for one star to local numbering 1..N."""
+    apertures = [int(v) for v in ap_indices]
+    if not apertures:
+        raise RuntimeError("Cannot build local aperture mapping from an empty aperture list.")
+    if len(set(apertures)) != len(apertures):
+        raise RuntimeError(
+            f"Local aperture mapping requires unique aperture IDs, got {apertures}."
+        )
 
-    try:
-        with open(geometry_path, "r") as fh:
-            payload = json.load(fh)
-    except Exception:
-        return []
-
-    apertures = []
-    for rec in payload.get("apertures", []):
-        try:
-            if int(rec.get("star")) != int(target_star):
-                continue
-            apertures.append(int(rec.get("aperture")))
-        except (TypeError, ValueError):
-            continue
-    return sorted(set(apertures))
+    sorted_apertures = sorted(apertures)
+    return {int(ap): int(idx) for idx, ap in enumerate(sorted_apertures, start=1)}
 
 
-def _read_apertures_from_extraction_pairs(extraction_pairs_path, target_star):
-    """Read target star apertures from extraction_pairs context CSV."""
-    if not extraction_pairs_path or not os.path.exists(extraction_pairs_path):
-        return []
-
-    try:
-        with open(extraction_pairs_path, "r", newline="") as fh:
-            reader = csv.DictReader(fh)
-            for row in reader:
-                try:
-                    if int(row.get("star")) != int(target_star):
-                        continue
-                except (TypeError, ValueError):
-                    continue
-                apertures = _expand_aperture_range_string(row.get("apertures", ""))
-                if apertures:
-                    return apertures
-    except Exception:
-        return []
-
-    return []
+def _format_aperture_mapping(aperture_mapping):
+    """Return compact human-readable mapping string (e.g. '5->1, 6->2')."""
+    return ", ".join(
+        f"{int(src)}->{int(dst)}"
+        for src, dst in sorted(aperture_mapping.items())
+    )
 
 
 def _read_apertures_from_apnum_cards(fits_path):
@@ -5342,100 +5521,26 @@ def _read_apertures_from_apnum_cards(fits_path):
     return sorted(set(apertures))
 
 
-def get_target_aperture_numbers(target_star, target_thar_path,
-                                geometry_path=None, extraction_pairs_path=None):
-    """Resolve target aperture numbers, preferring geometry mapping when available."""
-    apertures = _read_apertures_from_geometry_file(geometry_path, target_star)
-    source = "step5-geometry"
-    if not apertures:
-        apertures = _read_apertures_from_extraction_pairs(extraction_pairs_path, target_star)
-        source = "extraction-pairs"
-    if not apertures:
-        apertures = _read_apertures_from_apnum_cards(target_thar_path)
-        source = "APNUM"
-
+def _assert_local_apertures(fits_path, expected_count=4):
+    """Assert that extracted multispec APNUM apertures are local (1..N)."""
+    apertures = _read_apertures_from_apnum_cards(fits_path)
     if not apertures:
         raise RuntimeError(
-            f"Could not resolve aperture numbers for target star {int(target_star):02d}. "
-            f"Tried geometry={geometry_path}, extraction_pairs={extraction_pairs_path}, "
-            f"APNUM from {target_thar_path}."
+            f"Could not read APNUM apertures from extracted spectrum: {fits_path}. "
+            "Re-run step 6 with the new local-aperture renumbering code."
         )
-    return sorted(apertures), source
 
+    if expected_count is None:
+        expected = list(range(1, len(apertures) + 1))
+    else:
+        expected = list(range(1, int(expected_count) + 1))
 
-def _build_aperture_mapping(master_apertures, target_apertures, expected_count=4):
-    """Build one-to-one mapping from master reference apertures to target apertures."""
-    master = sorted(int(v) for v in master_apertures)
-    target = sorted(int(v) for v in target_apertures)
-
-    if len(master) != len(target):
+    if apertures != expected:
         raise RuntimeError(
-            "Master/target aperture count mismatch for temporary reference remapping: "
-            f"master={master}, target={target}."
+            f"Extracted spectrum has non-local APNUM apertures for {fits_path}. "
+            f"Expected {expected}, got {apertures}. "
+            "Re-run step 6 with the new local-aperture renumbering code."
         )
-    if expected_count is not None and len(target) != int(expected_count):
-        raise RuntimeError(
-            f"Expected {int(expected_count)} apertures for target remapping, "
-            f"got {len(target)} for target={target}."
-        )
-    if len(set(master)) != len(master) or len(set(target)) != len(target):
-        raise RuntimeError(
-            f"Aperture mapping requires unique aperture IDs. master={master}, target={target}."
-        )
-
-    return {int(src): int(dst) for src, dst in zip(master, target)}
-
-
-def _format_aperture_mapping(aperture_mapping):
-    """Return compact human-readable mapping string (e.g. '1->5, 2->6')."""
-    return ", ".join(
-        f"{int(src)}->{int(dst)}"
-        for src, dst in sorted(aperture_mapping.items())
-    )
-
-
-def _create_temporary_reference_fits(master_ref_thar, target_star):
-    """Create a fresh per-target temporary FITS copy from master reference."""
-    nonce = os.urandom(3).hex()
-    tmp_name = f".tmp_ref_star{int(target_star):02d}_{os.getpid()}_{nonce}.fits"
-    tmp_path = os.path.join(".", tmp_name)
-    shutil.copy2(master_ref_thar, tmp_path)
-    return tmp_path
-
-
-def _create_temporary_target_fits(target_thar, target_star):
-    """Create a fresh per-target temporary FITS copy from real target ThAr."""
-    nonce = os.urandom(3).hex()
-    tmp_name = f".tmp_tgt_star{int(target_star):02d}_{os.getpid()}_{nonce}.fits"
-    tmp_path = os.path.join(".", tmp_name)
-    shutil.copy2(target_thar, tmp_path)
-    return tmp_path
-
-
-def _resolve_master_reference_db(master_ref_thar):
-    """Resolve the existing master wavelength DB record for a reference ThAr."""
-    probes = [master_ref_thar, os.path.basename(master_ref_thar), stem(master_ref_thar)]
-    for probe in probes:
-        found_db, _candidates = resolve_existing_wavelength_db(probe)
-        if found_db:
-            return found_db
-    raise RuntimeError(
-        f"Could not resolve master wavelength DB record for reference ThAr: {master_ref_thar}"
-    )
-
-
-def _clone_temporary_reference_db(master_ref_thar, temp_ref_path):
-    """Clone master wavelength DB record to temp reference DB entry."""
-    master_db = _resolve_master_reference_db(master_ref_thar)
-    temp_candidates = wavelength_db_candidates(temp_ref_path, include_legacy=False)
-    if not temp_candidates:
-        raise RuntimeError(f"No DB candidates available for temporary reference: {temp_ref_path}")
-
-    temp_db = temp_candidates[0]
-    os.makedirs(os.path.dirname(temp_db) or ".", exist_ok=True)
-    shutil.copy2(master_db, temp_db)
-    normalize_ec_database_records(temp_db, iraf_spec_token(temp_ref_path))
-    return temp_db, master_db, temp_candidates
 
 
 def _wat2_keys_sorted(header):
@@ -5457,9 +5562,9 @@ def _renumber_wat2_payload(payload, aperture_mapping):
     return re.sub(r'(spec\d+\s*=\s*")([^\"]+)(")', _replace_spec, payload)
 
 
-def _renumber_temporary_reference_fits(temp_ref_path, aperture_mapping):
-    """Apply aperture remapping to APNUM* and WAT2 metadata in temp FITS copy."""
-    with fits.open(temp_ref_path, mode="update") as hdul:
+def _renumber_multispec_fits_apertures(fits_path, aperture_mapping):
+    """Apply aperture remapping to APNUM* and WAT2 metadata in a multispec FITS."""
+    with fits.open(fits_path, mode="update") as hdul:
         hdr = hdul[0].header
 
         for key in list(hdr.keys()):
@@ -5486,150 +5591,6 @@ def _renumber_temporary_reference_fits(temp_ref_path, aperture_mapping):
                 for key in wat_keys:
                     if int(str(key).split("_")[1]) > len(chunks):
                         del hdr[key]
-
-
-def _renumber_temporary_reference_db(temp_db_path, temp_ref_path, aperture_mapping):
-    """Apply identical aperture remapping to temporary wavelength DB record."""
-    tmp_image_token = iraf_spec_token(temp_ref_path)
-    normalize_ec_database_records(
-        temp_db_path,
-        tmp_image_token,
-        aperture_mapping=aperture_mapping,
-    )
-
-
-def _cleanup_temporary_reference_artifacts(temp_ref_path, temp_db_candidates):
-    """Best-effort cleanup for per-target temporary reference artifacts."""
-    removed = []
-    failed = []
-    cleanup_paths = [temp_ref_path] + list(dict.fromkeys(temp_db_candidates or []))
-    for path in cleanup_paths:
-        if not path or not os.path.lexists(path):
-            continue
-        try:
-            os.remove(path)
-            removed.append(path)
-        except OSError as exc:
-            failed.append(f"{path} ({exc})")
-    return removed, failed
-
-
-def _prepare_temp_reference_for_target(master_ref_thar, target_star, target_apertures):
-    """Create per-target temporary reference FITS+DB pair and apply remapping."""
-    master_apertures = _read_apertures_from_apnum_cards(master_ref_thar)
-    if not master_apertures:
-        raise RuntimeError(
-            f"Could not read APNUM apertures from master reference ThAr: {master_ref_thar}"
-        )
-
-    aperture_mapping = _build_aperture_mapping(
-        master_apertures,
-        target_apertures,
-        expected_count=4,
-    )
-
-    temp_ref_path = _create_temporary_reference_fits(master_ref_thar, target_star)
-    temp_db_path = None
-    temp_db_candidates = wavelength_db_candidates(temp_ref_path, include_legacy=False)
-    master_db_path = None
-
-    try:
-        temp_db_path, master_db_path, temp_db_candidates = _clone_temporary_reference_db(
-            master_ref_thar,
-            temp_ref_path,
-        )
-        _renumber_temporary_reference_fits(temp_ref_path, aperture_mapping)
-        _renumber_temporary_reference_db(temp_db_path, temp_ref_path, aperture_mapping)
-    except Exception:
-        _cleanup_temporary_reference_artifacts(temp_ref_path, temp_db_candidates)
-        raise
-
-    return {
-        "target_star": int(target_star),
-        "master_apertures": sorted(master_apertures),
-        "target_apertures": sorted(int(v) for v in target_apertures),
-        "aperture_mapping": aperture_mapping,
-        "temp_ref_path": temp_ref_path,
-        "temp_db_path": temp_db_path,
-        "master_db_path": master_db_path,
-        "cleanup_db_candidates": temp_db_candidates,
-    }
-
-
-def _prepare_temp_target_for_reidentify(master_ref_thar, target_thar, target_star, target_apertures):
-    """Create per-target temporary target FITS and remap target apertures to master apertures."""
-    master_apertures = _read_apertures_from_apnum_cards(master_ref_thar)
-    if not master_apertures:
-        raise RuntimeError(
-            f"Could not read APNUM apertures from master reference ThAr: {master_ref_thar}"
-        )
-
-    target_to_master = _build_aperture_mapping(
-        target_apertures,
-        master_apertures,
-        expected_count=4,
-    )
-    master_to_target = {int(dst): int(src) for src, dst in target_to_master.items()}
-
-    temp_target_path = _create_temporary_target_fits(target_thar, target_star)
-    temp_db_path = None
-    master_db_path = None
-    cleanup_db_candidates = wavelength_db_candidates(temp_target_path, include_legacy=False)
-
-    try:
-        _renumber_temporary_reference_fits(temp_target_path, target_to_master)
-        # Seed a temp DB entry so ecreidentify can resolve a valid target record.
-        temp_db_path, master_db_path, cleanup_db_candidates = _clone_temporary_reference_db(
-            master_ref_thar,
-            temp_target_path,
-        )
-        _renumber_temporary_reference_db(temp_db_path, temp_target_path, target_to_master)
-    except Exception:
-        _cleanup_temporary_reference_artifacts(temp_target_path, cleanup_db_candidates)
-        raise
-
-    return {
-        "target_star": int(target_star),
-        "target_apertures": sorted(int(v) for v in target_apertures),
-        "master_apertures": sorted(int(v) for v in master_apertures),
-        "target_to_master": target_to_master,
-        "master_to_target": master_to_target,
-        "temp_target_path": temp_target_path,
-        "temp_db_path": temp_db_path,
-        "master_db_path": master_db_path,
-        "cleanup_db_candidates": cleanup_db_candidates,
-    }
-
-
-def _transfer_reviewed_temp_target_solution_to_real_target(
-    temp_target_path,
-    real_target_thar,
-    master_to_target,
-):
-    """Transfer reviewed temp-target wavelength DB content back to real target identity."""
-    temp_db_path, temp_candidates = resolve_existing_wavelength_db(temp_target_path)
-    if not temp_db_path:
-        raise RuntimeError(
-            "Could not locate temporary target wavelength DB record after review. "
-            f"Checked: {', '.join(temp_candidates)}"
-        )
-
-    real_db_candidates = wavelength_db_candidates(real_target_thar, include_legacy=False)
-    if not real_db_candidates:
-        raise RuntimeError(f"No DB candidates available for real target: {real_target_thar}")
-
-    real_db_path = real_db_candidates[0]
-    os.makedirs(os.path.dirname(real_db_path) or ".", exist_ok=True)
-    shutil.copy2(temp_db_path, real_db_path)
-
-    # Rewrite to real target identity and restore real target aperture numbering.
-    _renumber_temporary_reference_db(real_db_path, real_target_thar, master_to_target)
-
-    return {
-        "temp_db_path": temp_db_path,
-        "real_db_path": real_db_path,
-        "real_db_candidates": real_db_candidates,
-    }
 
 
 def _extract_star_number(path):
@@ -6092,8 +6053,6 @@ def main():
         try:
             quartz_ref = args.quartz_reference
             require_existing(quartz_ref, "--quartz-reference")
-            if quartz and os.path.abspath(quartz) != os.path.abspath(quartz_ref):
-                ensure_quartz_trace_db_alias(quartz, quartz_ref)
         except Exception as exc:
             sys.exit(f"ERROR preparing explicit quartz reference: {exc}")
     elif quartz and any(s in selected_steps for s in (1, 5, 6)):
@@ -6161,8 +6120,6 @@ def main():
     state = {}
     obj_outputs = {}
     thar_outputs = {}
-    quartz_db_selection_cache = {}
-    state["quartz_trace_db_by_token"] = {}
 
     # Keep Python/IRAF workdirs explicitly aligned before step execution.
     try:
@@ -6171,20 +6128,11 @@ def main():
         sys.exit(f"ERROR re-anchoring proc working directory: {exc}")
 
     def remember_quartz_trace_db_once(quartz_candidate, requirement):
-        """Remember quartz DB selection once per token for the current run."""
-        token = quartz_reference_token(quartz_candidate)
-        db_by_token = state.setdefault("quartz_trace_db_by_token", {})
-        remembered = db_by_token.get(token)
-        if remembered and os.path.exists(remembered):
-            state["quartz_trace_db"] = remembered
-            return remembered
-
+        """Resolve canonical quartz DB for the current requirement."""
         selected = select_quartz_trace_db_candidate(
             quartz_candidate,
             requirement,
-            selection_cache=quartz_db_selection_cache,
         )
-        db_by_token[token] = selected
         state["quartz_trace_db"] = selected
         return selected
     
@@ -6197,13 +6145,11 @@ def main():
             quartz,
             n_ap    = n_ap,
         )
-        # Always normalize traced quartz DB identity to its own canonical token.
-        step1_alias = ensure_quartz_trace_db_alias(quartz, quartz)
-        debug_quartz_trace_db_state(quartz, "step1-self", alias_result=step1_alias)
-        # If extraction will use a different reference token, ensure alias DB too.
-        if quartz_ref and os.path.abspath(quartz) != os.path.abspath(quartz_ref):
-            step1_ref_alias = ensure_quartz_trace_db_alias(quartz, quartz_ref)
-            debug_quartz_trace_db_state(quartz_ref, "step1-ref", alias_result=step1_ref_alias)
+        try:
+            renumber_quartz_trace_db_apertures_sequential(quartz)
+            debug_quartz_trace_db_state(quartz, "step1-sequential")
+        except Exception as exc:
+            sys.exit(f"ERROR step 1 quartz DB postprocess: {exc}")
     elif any(s in selected_steps for s in (2, 6)):
         try:
             if 2 in selected_steps:
@@ -6211,8 +6157,7 @@ def main():
                     quartz,
                     "step 2",
                 )
-                step2_alias = ensure_quartz_trace_db_alias(quartz, quartz)
-                debug_quartz_trace_db_state(quartz, "step2-precheck", alias_result=step2_alias or selected_db)
+                debug_quartz_trace_db_state(quartz, "step2-precheck")
                 state["quartz_trace_db"] = selected_db
                 require_quartz_trace_db(quartz, "step 2")
             if 6 in selected_steps:
@@ -6225,11 +6170,9 @@ def main():
                     quartz_ref,
                     "step 6",
                 )
-                step6_pre_alias = ensure_quartz_trace_db_alias(quartz or quartz_ref, quartz_ref)
                 debug_quartz_trace_db_state(
                     quartz_ref,
                     "step6-early-precheck",
-                    alias_result=step6_pre_alias or selected_step6_db,
                 )
                 state["quartz_trace_db"] = selected_step6_db
                 require_quartz_trace_db(quartz_ref, "step 6")
@@ -6402,8 +6345,7 @@ def main():
                 "Provide --quartz or --quartz-reference, or run steps 1-4 first."
             )
         try:
-            step5_alias = ensure_quartz_trace_db_alias(quartz or preview_quartz, preview_quartz)
-            debug_quartz_trace_db_state(preview_quartz, "step5-precheck", alias_result=step5_alias)
+            debug_quartz_trace_db_state(preview_quartz, "step5-precheck")
             require_quartz_trace_db(preview_quartz, "step 5")
         except Exception as exc:
             sys.exit(f"ERROR dependency check: {exc}")
@@ -6483,8 +6425,7 @@ def main():
     # ── 6. Per-star extraction ────────────────────────────────────────────────
     if 6 in selected_steps:
         try:
-            step6_alias = ensure_quartz_trace_db_alias(quartz or quartz_ref, quartz_ref)
-            debug_quartz_trace_db_state(quartz_ref, "step6-precheck", alias_result=step6_alias)
+            debug_quartz_trace_db_state(quartz_ref, "step6-precheck")
             require_quartz_trace_db(quartz_ref, "step 6")
             require_existing(state["obj_ff"], "step 6 input object flat-corrected")
             require_existing(state["thar_ff"], "step 6 input thar flat-corrected")
@@ -6680,36 +6621,8 @@ def main():
                 f"ERROR: selected reference star {ref_star:02d} not found in ThAr outputs. "
                 f"Available: {available}"
             )
-        step5_geometry_path = None
-        extraction_pairs_path = None
-
         star_geometry = None
         try:
-            night_for_step9, shoe_for_step9 = infer_night_shoe(
-                meta_by_role,
-                reference_path=quartz_ref or quartz,
-                fallback_night=args.night,
-                fallback_shoe=args.shoe,
-            )
-            step5_geometry_path = default_geometry_path(
-                meta_by_role,
-                reference_path=quartz_ref or quartz,
-                fallback_night=args.night,
-                fallback_shoe=args.shoe,
-                fallback_plate=args.plate,
-            )
-            pair_candidates = candidate_extraction_pair_indices(
-                args.input_dir,
-                night=night_for_step9,
-                shoe=shoe_for_step9,
-                plate=args.plate,
-                object_name=args.object_name,
-            )
-            for candidate_pair_index in pair_candidates:
-                if os.path.exists(candidate_pair_index):
-                    extraction_pairs_path = candidate_pair_index
-                    break
-
             star_geometry_path = default_star_geometry_path(
                 meta_by_role,
                 reference_path=quartz_ref or quartz,
@@ -6730,7 +6643,7 @@ def main():
                     "falling back to numeric star order."
                 )
         except Exception as exc:
-            print(f"  [warn] Could not resolve star geometry path: {exc}")
+            print(f"  [warn] Could not resolve star geometry for step 9: {exc}")
         
         # If step 8 didn't run but we're running step 9, verify ref star has solution
         if 8 not in selected_steps:
@@ -6752,8 +6665,6 @@ def main():
             step9_min_fit_frac=args.step9_min_fit_frac,
             step9_max_rms=args.step9_max_rms,
             star_geometry=star_geometry,
-            step5_geometry_path=step5_geometry_path,
-            extraction_pairs_path=extraction_pairs_path,
         )
         state["step9_reviewed_thar_outputs"] = step9_result.get("reviewed_thar_outputs", {})
         state["step9_failed_gate_stars"] = step9_result.get("failed_gate_stars", [])
@@ -6856,14 +6767,14 @@ def main():
             )
         elif state.get("step9_reviewed_thar_outputs"):
             print(
-                "\n  Step 9 complete: ThAr line IDs propagated/reviewed and transferred to real targets."
+                "\n  Step 9 complete: ThAr line IDs propagated/reviewed directly on real targets."
             )
         elif obj_outputs:
             print(
                 "\n  Next steps for each star:\n"
                 "    Step 7  lineclean         ->  *_star<N>_ec-crr2.fits\n"
                 "    Step 8  ecidentify/ecreidentify on reference ThAr\n"
-                "    Step 9  ecreidentify + required review + transfer-back to real target ThAr DB\n"
+                "    Step 9  ecreidentify + required review on real target ThAr DB\n"
                 "    Step 10 refspec assignment on *_ec-crr2.fits (in-place)\n"
                 "    Step 11 dispcor linearization -> *_ec-crr2-dc.fits\n"
             )
