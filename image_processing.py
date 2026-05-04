@@ -32,6 +32,7 @@ import numpy as np
 from astropy.io import fits
 from astropy.table import Table, vstack
 from pyraf import iraf
+from tqdm.auto import tqdm
 
 from file_handler import (
     infiles_to_lists,
@@ -70,6 +71,26 @@ _LEGACY_STAGE_ALIASES = {
     'mcrr': STAGE_CR_CLEANED,
     'darksub': STAGE_DARK_SUBTRACTED,
 }
+
+STRING_METADATA_COLUMNS = (
+    'FILENAME',
+    'filename_input',
+    'OBJECT',
+    'OBJECT_NORM',
+    'EXPTYPE',
+    'EXPTYPE_NORM',
+    'IMAGE_TYPE',
+    'CLASS_REASON',
+    'NIGHT',
+    'SHOE',
+    'PLATE',
+    'OPAMP',
+    'LC-TIME',
+    'STACKTYP',
+    'STACKMOD',
+    'PROCSTEP',
+    STAGE_COL,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -314,10 +335,37 @@ def _group_keys_with_optional_plate(table, base_keys, mask=None):
     return keys
 
 
-def _ensure_string_columns(table, columns, width=256):
+def _stringify_metadata_value(value):
+    """Normalize metadata cells to plain strings before Astropy table merges."""
+    if np.ma.is_masked(value) or value is None:
+        return ''
+
+    if isinstance(value, bytes):
+        text = value.decode('utf-8', errors='ignore')
+    else:
+        try:
+            if np.issubdtype(type(value), np.floating) and np.isnan(value):
+                return ''
+        except TypeError:
+            pass
+        text = str(value)
+
+    text = text.strip()
+    if text.lower() in {'none', 'nan'}:
+        return ''
+    return text
+
+
+def _ensure_string_columns(table, columns=None, width=512):
+    if columns is None:
+        columns = STRING_METADATA_COLUMNS
+
     for col in columns:
-        if col in table.colnames:
-            table[col] = table[col].astype(f'U{width}')
+        if col not in table.colnames:
+            continue
+        values = [_stringify_metadata_value(value) for value in table[col]]
+        table[col] = np.array(values, dtype=f'U{width}')
+    return table
 
 
 def _print_image_type_counts(table, header):
@@ -719,7 +767,11 @@ def stack_dark_frames(comb_img_table, method='median'):
         print('WARNING [step6_dark_stack]: no dark groups were stackable.')
         return comb_img_table
 
-    result = vstack([comb_img_table, Table(new_rows)])
+    existing_table = comb_img_table.copy()
+    append_table = Table(new_rows)
+    _ensure_string_columns(existing_table)
+    _ensure_string_columns(append_table)
+    result = vstack([existing_table, append_table])
     _ensure_string_columns(result, ['FILENAME', 'filename_input'])
     _ensure_stage_column(result)
     return result
@@ -877,7 +929,11 @@ def science_frame_stacking(comb_img_table, sci_mask, mode, scale='none', image_t
     if not new_rows:
         return comb_img_table, []
 
-    result = vstack([comb_img_table, Table(new_rows)])
+    existing_table = comb_img_table.copy()
+    append_table = Table(new_rows)
+    _ensure_string_columns(existing_table)
+    _ensure_string_columns(append_table)
+    result = vstack([existing_table, append_table])
     _ensure_string_columns(result, ['FILENAME', 'filename_input'])
     _ensure_stage_column(result)
     return result, path_to_result
@@ -897,6 +953,11 @@ def step1_load(list_path, extra_columns, raw_dir, proc_dir):
         list_path,
         extra_columns=extra_columns,
     )
+
+    # Normalize metadata-like columns immediately after reading FITS headers.
+    # This prevents None/NaN/masked values from producing object-dtype columns
+    # that later break Astropy vstack calls.
+    _ensure_string_columns(images_table)
     _ensure_stage_column(images_table, default_stage=STAGE_RAW)
 
     unresolved = images_table.meta.get('UNRESOLVED_AMBIGUOUS_SIGNATURES', [])
@@ -936,8 +997,22 @@ def step2_overscan_trim(images_table, master_list, raw_dir):
     _log_step(2, 'Overscan fit & trim')
     suffix = 'ot'
 
-    for inlist in master_list:
-        raw_inlist, outlist = _make_step2_lists(inlist, raw_dir=raw_dir, suffix=suffix)
+    iterator = tqdm(
+        master_list,
+        total=len(master_list),
+        desc='STEP 2 overscan/trim',
+        unit='set',
+        dynamic_ncols=True,
+    )
+
+    for inlist in iterator:
+        iterator.set_postfix_str(os.path.basename(str(inlist)))
+
+        raw_inlist, outlist = _make_step2_lists(
+            inlist,
+            raw_dir=raw_dir,
+            suffix=suffix,
+        )
         pyraf_utils.run_ccdproc_ovefit_trim(raw_inlist, outlist)
 
     affix = f'-{suffix}'
@@ -997,7 +1072,11 @@ def step3_bias_stack(images_table):
         print('No stackable BIAS groups found; skipping step 3 append.')
         return images_table
 
-    result = vstack([images_table, Table(new_rows)])
+    existing_table = images_table.copy()
+    append_table = Table(new_rows)
+    _ensure_string_columns(existing_table)
+    _ensure_string_columns(append_table)
+    result = vstack([existing_table, append_table])
     _ensure_string_columns(result, ['FILENAME', 'filename_input'])
     _ensure_stage_column(result)
     return result
@@ -1152,7 +1231,10 @@ def step5_mosaic(images_table):
         return Table(rows=[])
 
     combined_images = Table(mosaics)
-    _ensure_string_columns(combined_images, ['FILENAME', 'filename_input'])
+
+    # Normalize the full mosaic metadata table before downstream dark/CR/stacking
+    # steps append new rows.
+    _ensure_string_columns(combined_images)
     _ensure_stage_column(combined_images, default_stage=STAGE_MOSAIC)
     return combined_images
 

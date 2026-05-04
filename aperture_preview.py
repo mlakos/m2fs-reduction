@@ -25,10 +25,14 @@ Options
 
 Fiber / aperture pattern
 ------------------------
-Default auto-assignment is sequential groups of four apertures from top to
-bottom:
+By default, apertures are assigned in sequential groups of --aps-per-star
+apertures from top to bottom. The default is 4:
 
     1 1 1 1  2 2 2 2  3 3 3 3  4 4 4 4 ...
+
+For example, --aps-per-star 6 gives:
+
+    1 1 1 1 1 1  2 2 2 2 2 2 ...
 
 Manual edits can override this pattern; edited apertures are treated as locks
 and are preserved during forward reflow.
@@ -64,29 +68,35 @@ from astropy.io import fits
 # Pattern generator
 # ---------------------------------------------------------------------------
 
-def default_pattern(n_apertures, n_stars=4):
+def default_pattern(n_apertures, n_stars=4, aps_per_star=4):
     """
     Return an array of length *n_apertures* with 1-based star indices,
-    assigned as sequential groups of four apertures from top to bottom.
+    assigned as sequential groups of *aps_per_star* apertures from top to
+    bottom.
 
     Example:
         1 1 1 1  2 2 2 2  3 3 3 3 ...
     """
-    return (np.arange(n_apertures, dtype=int) // 4) + 1
+    if aps_per_star < 1:
+        raise ValueError("aps_per_star must be >= 1")
+    return (np.arange(n_apertures, dtype=int) // aps_per_star) + 1
 
 
-def recompute_forward_with_locks(pattern, manual_locks, anchor_idx):
+def recompute_forward_with_locks(pattern, manual_locks, anchor_idx, aps_per_star=4):
     """Recompute affiliations forward from *anchor_idx* preserving locks.
 
     Rules:
       - All manual-locked apertures remain unchanged.
       - Recompute only apertures after *anchor_idx*.
-      - Unlocked apertures follow sequential 4-per-star groups from the most
-        recent anchor (explicit manual lock or the initial anchor aperture).
+      - Unlocked apertures follow sequential groups of *aps_per_star*
+        apertures from the most recent anchor (explicit manual lock or the
+        initial anchor aperture).
     """
     pat = np.array(pattern, dtype=int).copy()
     locks = np.array(manual_locks, dtype=bool)
     n = len(pat)
+    if aps_per_star < 1:
+        raise ValueError("aps_per_star must be >= 1")
     if n == 0 or anchor_idx is None:
         return pat
 
@@ -104,7 +114,7 @@ def recompute_forward_with_locks(pattern, manual_locks, anchor_idx):
             continue
 
         delta = i - current_anchor_idx
-        pat[i] = current_anchor_star + (delta // 4)
+        pat[i] = current_anchor_star + (delta // aps_per_star)
 
     return pat
 
@@ -357,13 +367,14 @@ class TraceViewer:
     """
 
     def __init__(self, image_data, centers, pattern, image_name, col, n_stars,
-                 trace_rows=None, save_prefix=None):
+                 trace_rows=None, save_prefix=None, aps_per_star=4):
         self.data       = image_data
         self.centers    = np.array(centers, dtype=float)
         self.pattern    = np.array(pattern, dtype=int)
         self.image_name = image_name
         self.col        = col
         self.n_stars    = n_stars
+        self.aps_per_star = int(aps_per_star)
         self.n_ap       = len(centers)
         self.trace_rows = trace_rows or {}
         self.save_prefix = str(save_prefix) if save_prefix is not None else os.path.splitext(image_name)[0]
@@ -615,7 +626,11 @@ class TraceViewer:
 
         # ---- r: reset --------------------------------------------------
         if key == "r":
-            self.pattern        = default_pattern(self.n_ap, self.n_stars)
+            self.pattern        = default_pattern(
+                self.n_ap,
+                self.n_stars,
+                aps_per_star=self.aps_per_star,
+            )
             self.manual_lock[:] = False
             self.deleted[:]     = False
             self.last_edit_idx = None
@@ -674,7 +689,10 @@ class TraceViewer:
             # Treat both manual locks and deleted apertures as locked (not recomputed)
             combined_locks = self.manual_lock | self.deleted
             self.pattern = recompute_forward_with_locks(
-                self.pattern, combined_locks, self.last_edit_idx
+                self.pattern,
+                combined_locks,
+                self.last_edit_idx,
+                aps_per_star=self.aps_per_star,
             )
             self._refresh_colors()
             print(
@@ -723,9 +741,21 @@ def parse_args():
                    help="Dispersion column for the spatial cut (default: image centre).")
     p.add_argument("--nstars", type=int, default=24,
                    help="Number of unique stars in the repeating pattern (default: 24).")
+    p.add_argument(
+        "--aps-per-star",
+        type=int,
+        default=4,
+        help=(
+            "Number of apertures/orders per star used for the automatic default "
+            "grouping. Manual edits can override this."
+        ),
+    )
     p.add_argument("--out",    type=str,   default=None,
                    help="Output file for the final aperture→star mapping.")
-    return p.parse_args()
+    args = p.parse_args()
+    if args.aps_per_star < 1:
+        p.error("--aps-per-star must be >= 1")
+    return args
 
 
 def load_image(path):
@@ -745,7 +775,7 @@ def save_mapping(path, image_name, centers, pattern):
     print(f"  Mapping saved to: {path}")
 
 
-def prepare_preview_state(image_path, nap=None, sep=5.0, col=None, n_stars=4):
+def prepare_preview_state(image_path, nap=None, sep=5.0, col=None, n_stars=4, aps_per_star=4):
     """Build preview inputs without opening UI or prompting the user."""
     data = load_image(image_path)
     nrows, ncols = data.shape
@@ -771,7 +801,7 @@ def prepare_preview_state(image_path, nap=None, sep=5.0, col=None, n_stars=4):
             extra = np.linspace(centers[-1] + sep, nrows - 1, nap - len(centers))
             centers = np.concatenate([centers, extra])
 
-    pattern = default_pattern(len(centers), n_stars=n_stars)
+    pattern = default_pattern(len(centers), n_stars=n_stars, aps_per_star=aps_per_star)
     image_name = os.path.basename(image_path)
 
     return {
@@ -785,6 +815,7 @@ def prepare_preview_state(image_path, nap=None, sep=5.0, col=None, n_stars=4):
         "pattern": pattern,
         "image_name": image_name,
         "n_stars": n_stars,
+        "aps_per_star": aps_per_star,
     }
 
 
@@ -835,7 +866,11 @@ def main():
     print(f"  Apertures found: {n_ap}")
 
     # ── build initial star pattern ──────────────────────────────────────────
-    pattern = default_pattern(n_ap, n_stars=args.nstars)
+    pattern = default_pattern(
+        n_ap,
+        n_stars=args.nstars,
+        aps_per_star=args.aps_per_star,
+    )
 
     unique_stars = np.unique(pattern)
     print(f"  Stars in pattern: {unique_stars}")
@@ -857,6 +892,7 @@ def main():
         args.nstars,
         trace_rows=trace_rows,
         save_prefix=save_prefix,
+        aps_per_star=args.aps_per_star,
     )
 
     print("\n  Opening interactive preview window …")
@@ -889,7 +925,7 @@ def main():
 # ── convenience wrapper for calling from a notebook / other script ──────────
 
 def run_preview(image_path, nap=None, sep=5.0, col=None, n_stars=4, out=None,
-                interactive=True, pattern_override=None):
+                interactive=True, pattern_override=None, aps_per_star=4):
     """
     Programmatic entry point – mirrors the CLI but returns (centers, pattern).
 
@@ -906,6 +942,7 @@ def run_preview(image_path, nap=None, sep=5.0, col=None, n_stars=4, out=None,
         sep=sep,
         col=col,
         n_stars=n_stars,
+        aps_per_star=aps_per_star,
     )
 
     data = state["data"]
@@ -952,6 +989,7 @@ def run_preview(image_path, nap=None, sep=5.0, col=None, n_stars=4, out=None,
         n_stars,
         trace_rows=trace_rows,
         save_prefix=save_prefix,
+        aps_per_star=aps_per_star,
     )
 
     print(f"\n  Opening interactive preview for {image_name} …")

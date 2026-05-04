@@ -1847,7 +1847,7 @@ def flatcorrect_images(thar, obj, twilight, master_flat):
 # ---------------------------------------------------------------------------
 
 def run_aperture_preview(preview_image, n_stars, sep, preview_out=None,
-                        interactive=True, pattern_override=None):
+                        interactive=True, pattern_override=None, aps_per_star=4):
     """
     Open the interactive matplotlib preview on a reference image for assigning
     aperture traces to stars. This does not require the final extraction image;
@@ -1864,7 +1864,7 @@ def run_aperture_preview(preview_image, n_stars, sep, preview_out=None,
             "  [warn] aperture_preview.py not importable.\n"
             "         Falling back to auto-generated pattern (no interactive preview)."
         )
-        return _fallback_pattern(preview_image, n_stars, sep)
+        return _fallback_pattern(preview_image, n_stars, sep, aps_per_star=aps_per_star)
 
     print(
         f"  Image: {preview_image}\n\n"
@@ -1883,6 +1883,7 @@ def run_aperture_preview(preview_image, n_stars, sep, preview_out=None,
         out=preview_out,
         interactive=interactive,
         pattern_override=pattern_override,
+        aps_per_star=aps_per_star,
     )
 
     # Print a summary for the terminal log
@@ -1908,7 +1909,7 @@ def run_aperture_preview(preview_image, n_stars, sep, preview_out=None,
     return centers, pattern
 
 
-def _fallback_pattern(image_path, n_stars, sep):
+def _fallback_pattern(image_path, n_stars, sep, aps_per_star=4):
     """Auto-generate centers + pattern without any interactive window."""
     from astropy.io import fits as _fits
     with _fits.open(image_path) as hdul:
@@ -1926,9 +1927,13 @@ def _fallback_pattern(image_path, n_stars, sep):
     # Keep non-interactive fallback identical to aperture_preview default mapping.
     try:
         from aperture_preview import default_pattern as _default_pattern
-        pattern = _default_pattern(len(centers), n_stars=n_stars)
+        pattern = _default_pattern(
+            len(centers),
+            n_stars=n_stars,
+            aps_per_star=aps_per_star,
+        )
     except Exception:
-        pattern = (np.arange(len(centers), dtype=int) // 4) + 1
+        pattern = (np.arange(len(centers), dtype=int) // aps_per_star) + 1
     return centers, np.array(pattern, dtype=int)
 
 
@@ -3885,6 +3890,15 @@ def parse_args():
                    help="Continue despite metadata mismatch warnings.")
     p.add_argument("--nstars", type=int, default=24,
                    help="Number of unique stars in the pattern (default: 24).")
+    p.add_argument(
+        "--aps-per-star",
+        type=int,
+        default=4,
+        help=(
+            "Number of apertures/orders per star used by aperture_preview.py for "
+            "automatic grouping. Manual preview edits can override this."
+        ),
+    )
     p.add_argument("--sep", type=float, default=8.0,
                    help="Approx. spatial separation between apertures in px (default: 8).")
     p.add_argument("--nap", type=int, default=None,
@@ -6249,6 +6263,8 @@ def main():
         sys.exit("ERROR: --step9-min-fit-frac must be within [0, 1].")
     if args.step9_max_rms < 0.0:
         sys.exit("ERROR: --step9-max-rms must be non-negative.")
+    if args.aps_per_star < 1:
+        sys.exit("ERROR: --aps-per-star must be a positive integer.")
     if args.ref_star is not None and args.ref_star < 1:
         sys.exit("ERROR: --ref-star must be a positive integer.")
     if args.retrofit_only and not args.retrofit_thar_refspec:
@@ -6358,6 +6374,7 @@ def main():
             ("object",   obj if obj else "<not required>"),
             ("twilight", twilight if twilight else "<not required>"),
             ("n_stars",  args.nstars),
+            ("aps_per_star", args.aps_per_star),
             ("sep",      f"{args.sep} px"),
             ("dispaxis", args.dispaxis),
             ("steps",    f"{args.start_step}..{args.end_step}"),
@@ -6652,11 +6669,13 @@ def main():
         preview_out = os.path.splitext(map_path)[0] + "_preview_map.txt"
 
         try:
+            print(f"  Aperture preview auto-grouping: {args.aps_per_star} apertures per star")
             centers, pattern = run_aperture_preview(
                 preview_quartz,
                 n_stars = args.nstars,
                 sep     = args.sep,
                 preview_out=preview_out,
+                aps_per_star=args.aps_per_star,
             )
         except Exception as exc:
             sys.exit(f"ERROR step 5 preview: {exc}")
@@ -6703,7 +6722,12 @@ def main():
                     "--affiliation-map, or use --use-auto-pattern."
                 )
             section_banner("Step 5 (skipped) – Using fallback aperture pattern")
-            _centers, pattern = _fallback_pattern(state["obj_ff"], args.nstars, args.sep)
+            _centers, pattern = _fallback_pattern(
+                state["obj_ff"],
+                args.nstars,
+                args.sep,
+                aps_per_star=args.aps_per_star,
+            )
             state["pattern"] = pattern
             print(f"  Auto pattern generated: {len(pattern)} apertures")
 

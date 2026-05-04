@@ -52,6 +52,24 @@ def normalize_header_value(value):
     return text
 
 
+def _sanitize_header_table_value(value):
+    """Collapse null-like FITS header values before building Astropy rows."""
+    if np.ma.is_masked(value) or value is None:
+        return ''
+    if isinstance(value, bytes):
+        text = value.decode('utf-8', errors='ignore').strip()
+        return '' if text.lower() in {'none', 'nan'} else text
+    if isinstance(value, str):
+        text = value.strip()
+        return '' if text.lower() in {'none', 'nan'} else text
+    try:
+        if np.issubdtype(type(value), np.floating) and np.isnan(value):
+            return ''
+    except TypeError:
+        pass
+    return value
+
+
 def _normalized_signature(exptype_norm, object_norm):
     return f'exptype={exptype_norm}|object={object_norm}'
 
@@ -584,9 +602,9 @@ def construct_table_of_images(
     for f in list_file:
         PATH = os.path.join(prepath, f.strip())
         hdr = fits.getheader(PATH)
-        row = {'FILENAME': hdr.get('FILENAME', '')}
+        row = {'FILENAME': _sanitize_header_table_value(hdr.get('FILENAME', ''))}
         for c in columns:
-            row.update({c: hdr.get(c, '')})
+            row.update({c: _sanitize_header_table_value(hdr.get(c, ''))})
         row.update({'filename_input':f.strip()})
         rows.append(row)
         
