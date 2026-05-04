@@ -6,6 +6,8 @@ Converted from image_processing.ipynb.
 
 Usage:
     python image_processing.py --infiles /path/to/data/infiles [options]
+    By default the script deletes conservative intermediate preprocessing products
+    after successful completion; pass `--cleanup false` to keep them.
 
 Steps executed (in order):
     1.  Load & initialise IRAF/PyRAF
@@ -1596,9 +1598,115 @@ def _print_end_summary(table):
     print(f"Unresolved ambiguous subsets: {unresolved_count}")
 
 
+def _is_echelle_product_name(name):
+    lower = str(name).lower()
+    if re.search(r"_star\d+_ec(?:-crr2(?:-dc)?)?\.fits$", lower):
+        return True
+    if lower.endswith(("-sl.fits", "_med.fits", "_nflat.fits", "-dc.fits")):
+        return True
+    return False
+
+
+def _is_final_preprocess_product(path):
+    try:
+        hdr = fits.getheader(path)
+    except Exception:
+        return False
+
+    image_type = str(hdr.get("IMAGE_TYPE", "")).strip().upper()
+    stage = _normalize_stage(hdr.get(STAGE_COL, ""))
+    stacked = bool(hdr.get("STACKED", False))
+    exptype = str(hdr.get("EXPTYPE", "")).strip().lower()
+
+    if image_type == "DARK_MASTER":
+        return True
+
+    if image_type in {"SCIENCE", "QUARTZ", "LAMP", "TWILIGHT"}:
+        if stacked or stage == STAGE_STACKED or exptype.endswith("_stack"):
+            return True
+
+    return False
+
+
+def _cleanup_candidate_patterns():
+    return [
+        "*-ot.fits",
+        "*-B.fits",
+        "*-full.fits",
+        "*-d.fits",
+        "*-mcrr.fits",
+        "*-f.fits",
+        "Master_bias_*.fits",
+        "*.list",
+        "*-ot-full-D.fits",
+    ]
+
+
+def cleanup_preprocessing_intermediates(proc_dir):
+    """Delete conservative preprocessing intermediates from proc_dir only."""
+    proc_dir = os.path.abspath(proc_dir)
+    if not os.path.isdir(proc_dir):
+        print(f"WARNING [cleanup]: proc_dir does not exist: {proc_dir}")
+        return []
+
+    deleted = []
+    skipped = []
+
+    for pattern in _cleanup_candidate_patterns():
+        for path in sorted(glob.glob(os.path.join(proc_dir, pattern))):
+            if not os.path.isfile(path):
+                continue
+
+            name = os.path.basename(path)
+
+            # Never delete echelle-stage products.
+            if _is_echelle_product_name(name):
+                skipped.append((path, "echelle product"))
+                continue
+
+            # Never delete final preprocessing products needed by reduce_echelle.
+            if name.lower().endswith(".fits") and _is_final_preprocess_product(path):
+                skipped.append((path, "final preprocessing product"))
+                continue
+
+            try:
+                os.remove(path)
+                deleted.append(path)
+            except Exception as exc:
+                skipped.append((path, f"delete failed: {exc}"))
+
+    print("\n============================================================")
+    print("CLEANUP")
+    print("============================================================")
+    print(f"Deleted intermediate files: {len(deleted)}")
+    """
+    for path in deleted:
+        print(f"  deleted: {os.path.basename(path)}")
+    """
+    if skipped:
+        print(f"Skipped files: {len(skipped)}")
+        for path, reason in skipped:
+            print(f"  skipped: {os.path.basename(path)} ({reason})")
+
+    return deleted
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+
+def _str_to_bool(value):
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"true", "1", "yes", "y", "on"}:
+        return True
+    if text in {"false", "0", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(
+        "Expected true/false, yes/no, 1/0, or on/off."
+    )
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -1671,6 +1779,17 @@ def parse_args():
         '--plate',
         default=None,
         help='Restrict resume scan to this PLATE value.',
+    )
+    parser.add_argument(
+        "--cleanup",
+        type=_str_to_bool,
+        default=True,
+        metavar='CLEANUP',
+        help=(
+            "Delete conservative preprocessing intermediate products after "
+            "successful completion: *-ot, *-B, *-full, *-d, *-mcrr, *-f, "
+            "Master_bias_*.fits, and *.list. Default: true."
+        ),
     )
     return parser.parse_args()
 
@@ -1771,6 +1890,11 @@ def main():
 
     _print_end_summary(final_table)
     _log_step('OK', 'Pipeline complete')
+
+    if args.cleanup:
+        cleanup_preprocessing_intermediates(proc_dir)
+    else:
+        print('\nCleanup disabled (--cleanup false); keeping preprocessing intermediates.')
 
 
 if __name__ == '__main__':

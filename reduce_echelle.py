@@ -414,7 +414,8 @@ def iter_candidate_fits_paths(args):
 
 
 def _infer_scope_from_resolved(args, resolved):
-    night = str(args.night) if args.night else None
+    allow_mixed_nights = bool(getattr(args, "allow_mixed_nights", False))
+    night = None if allow_mixed_nights else (str(args.night) if args.night else None)
     shoe = str(args.shoe).upper() if args.shoe else None
     plate = str(args.plate) if args.plate else None
 
@@ -436,7 +437,7 @@ def _infer_scope_from_resolved(args, resolved):
         if plate_val:
             plates.add(plate_val)
 
-    if night is None and len(nights) == 1:
+    if (not allow_mixed_nights) and night is None and len(nights) == 1:
         night = next(iter(nights))
     if shoe is None and len(shoes) == 1:
         shoe = next(iter(shoes))
@@ -449,6 +450,7 @@ def _infer_scope_from_resolved(args, resolved):
 def collect_header_inventory(args, resolved, required_roles=None):
     """Collect run-local FITS header combinations for unresolved-role prompts."""
     required_roles = set(required_roles or ())
+    allow_mixed_nights = bool(getattr(args, "allow_mixed_nights", False))
     override_path_arg = getattr(args, "image_type_override_path", None)
     overrides, override_path = load_image_type_overrides(override_path_arg)
 
@@ -505,7 +507,11 @@ def collect_header_inventory(args, resolved, required_roles=None):
         # DARK_MASTER fallback is allowed across NIGHT/PLATE; keep those as
         # informational metadata while still constraining non-dark roles.
         candidate_roles = meta.get("CANDIDATE_ROLES", set())
-        if scope_night and night != scope_night and "dark" not in candidate_roles:
+        if (
+            (not allow_mixed_nights) and
+            scope_night and night != scope_night and
+            "dark" not in candidate_roles
+        ):
             continue
         if scope_plate and plate != scope_plate and "dark" not in candidate_roles:
             continue
@@ -930,6 +936,22 @@ def _prompt_for_missing_roles_from_inventory(args, missing_roles, inventory):
         else:
             predicted = [g for g in groups if role in g.get("candidate_roles", set())]
             role_groups = predicted if predicted else list(groups)
+
+        if (
+            role == "object"
+            and bool(getattr(args, "allow_mixed_nights", False))
+            and getattr(args, "night", None)
+        ):
+            requested_night = str(args.night)
+            role_groups = [
+                g for g in role_groups
+                if str(g.get("night", "")) == requested_night
+            ]
+            predicted = [
+                g for g in predicted
+                if str(g.get("night", "")) == requested_night
+            ]
+
         if not role_groups:
             continue
 
@@ -1239,9 +1261,16 @@ def _resolve_prompted_roles_from_inventory(selection_by_role):
     return resolved
 
 
-def discover_inputs(input_dir, night=None, shoe=None, plate=None, object_name=None, required_roles=None):
-    """Auto-discover required role files from metadata-rich FITS products."""
+def discover_inputs(input_dir, night=None, shoe=None, plate=None, object_name=None,
+                    required_roles=None, allow_mixed_nights=False):
+    """Auto-discover required role files from metadata-rich FITS products.
+
+    In default mode, `night` constrains all non-dark roles.
+    With `allow_mixed_nights=True`, `night` anchors science-object selection
+    only; calibration roles may come from other nights.
+    """
     required_roles = set(required_roles or ("quartz", "thar", "object", "twilight"))
+    allow_mixed_nights = bool(allow_mixed_nights)
     fits_paths = sorted(glob.glob(os.path.join(input_dir, "*.fits")))
     by_role = {"quartz": [], "thar": [], "object": [], "twilight": [], "dark": []}
     skipped = 0
@@ -1267,8 +1296,13 @@ def discover_inputs(input_dir, night=None, shoe=None, plate=None, object_name=No
         if role is None and _is_dark_master_candidate(meta):
             role = "dark"
 
-        if role != "dark" and night and str(meta["NIGHT"]) != str(night):
-            continue
+        if night and str(meta["NIGHT"]) != str(night):
+            if not allow_mixed_nights:
+                if role != "dark":
+                    continue
+            elif role == "object":
+                # In mixed-night mode, --night anchors science-target matching.
+                continue
         if shoe and str(meta["SHOE"]).upper() != str(shoe).upper():
             continue
         if role != "dark" and plate and str(meta.get("PLATE", "")) != str(plate):
@@ -1292,7 +1326,9 @@ def discover_inputs(input_dir, night=None, shoe=None, plate=None, object_name=No
         if object_meta is not None:
             selected["object"] = object_meta["path"]
 
-    inferred_night = night if night else (object_meta["NIGHT"] if object_meta else None)
+    inferred_night = None if allow_mixed_nights else (
+        night if night else (object_meta["NIGHT"] if object_meta else None)
+    )
     inferred_shoe = shoe if shoe else (object_meta["SHOE"] if object_meta else None)
     inferred_plate = plate if plate else (object_meta.get("PLATE") if object_meta else None)
 
@@ -1357,6 +1393,7 @@ def resolve_inputs(args, required_roles=None):
             plate=args.plate,
             object_name=args.object_name,
             required_roles=required_roles,
+            allow_mixed_nights=getattr(args, "allow_mixed_nights", False),
         )
         resolved.update(discovered)
 
@@ -1426,6 +1463,8 @@ def resolve_inputs(args, required_roles=None):
 
 def validate_input_set(meta_by_role, args):
     """Validate metadata consistency and gate mismatches by confirmation."""
+    info = []
+    allow_mixed_nights = bool(getattr(args, "allow_mixed_nights", False))
     warnings = []
     nights = {meta_by_role[r]["NIGHT"] for r in meta_by_role}
     shoes = {meta_by_role[r]["SHOE"] for r in meta_by_role}
@@ -1435,7 +1474,11 @@ def validate_input_set(meta_by_role, args):
         if str(meta_by_role[r].get("PLATE", "")).strip()
     }
     if len(nights) != 1:
-        warnings.append(f"Mixed NIGHT values: {sorted(nights)}")
+        msg = f"Mixed NIGHT values: {sorted(nights)}"
+        if allow_mixed_nights:
+            info.append(msg + " (--allow-mixed-nights)")
+        else:
+            warnings.append(msg)
     if len(shoes) != 1:
         warnings.append(f"Mixed SHOE values: {sorted(shoes)}")
     if len(plates) > 1:
@@ -1454,6 +1497,11 @@ def validate_input_set(meta_by_role, args):
                 f"Role mismatch for {role}: metadata looks like '{observed}' "
                 f"(IMAGE_TYPE={meta.get('IMAGE_TYPE', '')}, EXPTYPE={meta['EXPTYPE']}, OBJECT={meta['OBJECT']})"
             )
+
+    if info:
+        section_banner("Input metadata notes")
+        for item in info:
+            print(f"  [info] {item}")
 
     if not warnings:
         return
@@ -3880,6 +3928,18 @@ def parse_args():
                    help="Pass --flat <file> to image_processing.py.")
     p.add_argument("--night", default=None,
                    help="Restrict auto-discovery to this NIGHT value.")
+    p.add_argument(
+        "--allow-mixed-nights",
+        "--no-night-match",
+        dest="allow_mixed_nights",
+        action="store_true",
+        help=(
+            "Allow quartz/ThAr/object/twilight inputs to have different NIGHT "
+            "metadata. With --night, the science object discovery is still "
+            "restricted to that night, but calibration roles are not forced to "
+            "match the object night."
+        ),
+    )
     p.add_argument("--shoe", default=None, choices=["B", "R", "b", "r"],
                    help="Restrict auto-discovery to this SHOE value.")
     p.add_argument("--plate", default=None,
@@ -4214,9 +4274,11 @@ def _preprocess_variant_stage(path):
 
 
 def inspect_preprocess_state(proc_dir, night=None, shoe=None, plate=None,
-                             object_name=None, required_roles=None):
+                             object_name=None, required_roles=None,
+                             allow_mixed_nights=False):
     """Inspect proc products and summarize reusable preprocessing state."""
     required_roles = set(required_roles or ("quartz", "thar", "object", "twilight"))
+    allow_mixed_nights = bool(allow_mixed_nights)
     object_filter = str(object_name or "").strip().lower()
     role_stage_sets = {role: set() for role in required_roles}
     stacked_by_role = {role: [] for role in required_roles}
@@ -4254,7 +4316,12 @@ def inspect_preprocess_state(proc_dir, night=None, shoe=None, plate=None,
         dark_like = row_image_type in {"DARK", "DARK_MASTER"} or ("dark" in exptype_text)
 
         context_ok = True
-        if night is not None and (not dark_like) and row_night != str(night):
+        if (
+            (not allow_mixed_nights) and
+            night is not None and
+            (not dark_like) and
+            row_night != str(night)
+        ):
             context_ok = False
         if shoe is not None and row_shoe.upper() != str(shoe).upper():
             context_ok = False
@@ -4428,6 +4495,7 @@ def run_image_preprocessing(args, raw_input_dir, required_roles):
         plate=args.plate,
         object_name=requested_object,
         required_roles=required_roles,
+        allow_mixed_nights=getattr(args, "allow_mixed_nights", False),
     )
     plan = choose_preprocess_plan(
         state,
@@ -4494,6 +4562,7 @@ def run_image_preprocessing(args, raw_input_dir, required_roles):
         plate=args.plate,
         object_name=requested_object,
         required_roles=required_roles,
+        allow_mixed_nights=getattr(args, "allow_mixed_nights", False),
     )
     missing_after = [role for role in required_roles if role not in post]
     if missing_after:
@@ -6377,6 +6446,7 @@ def main():
             ("aps_per_star", args.aps_per_star),
             ("sep",      f"{args.sep} px"),
             ("dispaxis", args.dispaxis),
+            ("mixedN",   "yes" if args.allow_mixed_nights else "no"),
             ("steps",    f"{args.start_step}..{args.end_step}"),
             ("aff_map",  args.affiliation_map if args.affiliation_map else "<auto>"),
     ]:
