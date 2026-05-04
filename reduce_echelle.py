@@ -3214,7 +3214,8 @@ def auto_wavelength_propagation(crr2_outputs, thar_outputs, ref_star,
                                 step9_min_fit_frac=0.05,
                                 step9_max_rms=0.30,
                                 star_geometry=None,
-                                aps_per_star=4):
+                                aps_per_star=4,
+                                chain_reid=False):
     """Step 9: automatic line-ID propagation and required review for non-reference stars."""
     section_banner("Step 9 – Automatic line-ID propagation (ecreidentify + review)")
     iraf.noao()
@@ -3222,7 +3223,15 @@ def auto_wavelength_propagation(crr2_outputs, thar_outputs, ref_star,
     iraf.onedspec()
 
     thar_ec_ref = thar_outputs[ref_star]
+    active_reference_star = ref_star
+    active_reference_thar = thar_ec_ref
     _assert_local_apertures(thar_ec_ref, expected_count=aps_per_star)
+    print(f"  Step 9 reference mode: {'chain-reid' if chain_reid else 'fixed-reference'}")
+    if chain_reid:
+        print(
+            "  chain-reid: each successfully reviewed ThAr becomes the "
+            "reference for the next star in the Step-9 processing order."
+        )
 
     reviewed_thar_outputs = {}
     failed_gate_stars = []
@@ -3240,15 +3249,23 @@ def auto_wavelength_propagation(crr2_outputs, thar_outputs, ref_star,
             f"action={gate_action}"
         )
 
-    star_order = star_order_by_distance_from_reference(
-        star_geometry,
-        ref_star,
-        list(crr2_outputs.keys()),
-    )
+    if chain_reid:
+        star_order = star_order_one_direction_from_reference(
+            ref_star,
+            list(crr2_outputs.keys()),
+        )
+        order_note = "one-direction numeric chain from reference (--chain-reid)"
+    else:
+        star_order = star_order_by_distance_from_reference(
+            star_geometry,
+            ref_star,
+            list(crr2_outputs.keys()),
+        )
+        order_note = "bidirectional outward from reference when geometry is available"
     print(
         "  Step 9 order: "
         + ", ".join(f"{int(s):02d}" for s in star_order)
-        + " (bidirectional outward from reference when geometry is available)"
+        + f" ({order_note})"
     )
 
     for star in star_order:
@@ -3266,12 +3283,16 @@ def auto_wavelength_propagation(crr2_outputs, thar_outputs, ref_star,
         else:
             _assert_local_apertures(thar_ec, expected_count=aps_per_star)
             gate_failed = False
+            reference_for_this_star = active_reference_thar if chain_reid else thar_ec_ref
+            reference_star_for_this_star = active_reference_star if chain_reid else ref_star
             print("     ecreidentify on real target")
+            print(f"     reference star   : {reference_star_for_this_star:02d}")
+            print(f"     reference ThAr   : {reference_for_this_star}")
             metrics = _ecreidentify_thar(
                 thar_ec,
-                thar_ec_ref,
+                reference_for_this_star,
                 drift_log_path=drift_log_path,
-                drift_stage="step9_propagation",
+                drift_stage="step9_chain_reid" if chain_reid else "step9_propagation",
             )
             print("     ecreidentify     : complete")
 
@@ -3297,12 +3318,29 @@ def auto_wavelength_propagation(crr2_outputs, thar_outputs, ref_star,
             if not gate_failed:
                 print("     review on real target")
                 _review_reidentified_lines(thar_ec, coordlist=coordlist)
+
+                stamp_ok = True
                 try:
                     mark_spectrum_as_reference(thar_ec)
                 except Exception as exc:
+                    stamp_ok = False
                     print(f"     [warn] self-reference stamp failed for real target ThAr: {exc}")
+
                 print("     reviewed real target DB ready")
                 reviewed_thar_outputs[star] = thar_ec
+
+                if chain_reid:
+                    if stamp_ok:
+                        active_reference_star = star
+                        active_reference_thar = thar_ec
+                        print(
+                            f"     chain update     : next reference star={active_reference_star:02d} "
+                            f"ThAr={active_reference_thar}"
+                        )
+                    else:
+                        print(
+                            "     chain update     : skipped because ThAr self-reference stamping failed"
+                        )
 
             if gate_failed:
                 continue
@@ -4042,6 +4080,15 @@ def parse_args():
         type=float,
         default=0.30,
         help="Step-9 maximum accepted ecreidentify RMS (default: 0.30).",
+    )
+    p.add_argument(
+        "--chain-reid",
+        action="store_true",
+        help=(
+            "Step-9 mode: use the last successfully reviewed/reidentified ThAr "
+            "as the ecreidentify reference for the next star. Default is off, "
+            "which uses the Step-8 reference ThAr for every star."
+        ),
     )
     p.add_argument(
         "--step10-refspec-debug",
@@ -5827,6 +5874,36 @@ def star_order_by_distance_from_reference(star_geometry, ref_star, available_sta
     return ordered
 
 
+def star_order_one_direction_from_reference(ref_star, available_stars):
+    """Return one-direction numeric chain order starting at ref_star.
+
+    This is intended for --chain-reid. The reference must be at one edge
+    of the selected stars so that the chain proceeds monotonically without
+    jumping across the detector/fiber sequence.
+    """
+    stars_sorted = sorted(int(s) for s in available_stars)
+    ref_star = int(ref_star)
+
+    if ref_star not in stars_sorted:
+        return stars_sorted
+
+    ref_index = stars_sorted.index(ref_star)
+
+    if ref_index == 0:
+        return stars_sorted
+
+    if ref_index == len(stars_sorted) - 1:
+        return list(reversed(stars_sorted))
+
+    raise RuntimeError(
+        "--chain-reid requires --ref-star to be at one edge of the selected stars. "
+        f"Available stars: {', '.join(f'{s:02d}' for s in stars_sorted)}; "
+        f"ref_star={ref_star:02d}. "
+        "Choose the first or last available star as the chain reference, "
+        "or run without --chain-reid."
+    )
+
+
 def _first_int_in_text(value):
     """Return first integer token found in value, otherwise None."""
     m = re.search(r"[-+]?\d+", str(value))
@@ -7046,6 +7123,7 @@ def main():
             step9_max_rms=args.step9_max_rms,
             star_geometry=star_geometry,
             aps_per_star=args.aps_per_star,
+            chain_reid=args.chain_reid,
         )
         state["step9_reviewed_thar_outputs"] = step9_result.get("reviewed_thar_outputs", {})
         state["step9_failed_gate_stars"] = step9_result.get("failed_gate_stars", [])
