@@ -3213,7 +3213,8 @@ def auto_wavelength_propagation(crr2_outputs, thar_outputs, ref_star,
                                 step9_min_found_frac=0.05,
                                 step9_min_fit_frac=0.05,
                                 step9_max_rms=0.30,
-                                star_geometry=None):
+                                star_geometry=None,
+                                aps_per_star=4):
     """Step 9: automatic line-ID propagation and required review for non-reference stars."""
     section_banner("Step 9 – Automatic line-ID propagation (ecreidentify + review)")
     iraf.noao()
@@ -3221,7 +3222,7 @@ def auto_wavelength_propagation(crr2_outputs, thar_outputs, ref_star,
     iraf.onedspec()
 
     thar_ec_ref = thar_outputs[ref_star]
-    _assert_local_apertures(thar_ec_ref, expected_count=4)
+    _assert_local_apertures(thar_ec_ref, expected_count=aps_per_star)
 
     reviewed_thar_outputs = {}
     failed_gate_stars = []
@@ -3263,7 +3264,7 @@ def auto_wavelength_propagation(crr2_outputs, thar_outputs, ref_star,
             print("     (reference star — solution from step 8)")
             reviewed_thar_outputs[star] = thar_ec
         else:
-            _assert_local_apertures(thar_ec, expected_count=4)
+            _assert_local_apertures(thar_ec, expected_count=aps_per_star)
             gate_failed = False
             print("     ecreidentify on real target")
             metrics = _ecreidentify_thar(
@@ -7044,6 +7045,7 @@ def main():
             step9_min_fit_frac=args.step9_min_fit_frac,
             step9_max_rms=args.step9_max_rms,
             star_geometry=star_geometry,
+            aps_per_star=args.aps_per_star,
         )
         state["step9_reviewed_thar_outputs"] = step9_result.get("reviewed_thar_outputs", {})
         state["step9_failed_gate_stars"] = step9_result.get("failed_gate_stars", [])
