@@ -41,6 +41,8 @@ PROMPT_IMAGE_TYPE_ROLES = [
     ('fibermap', 'FIBERMAP', 'fibermap'),
 ]
 
+_MANUAL_COLUMN_SELECTION = '__MANUAL_COLUMN_SELECTION__'
+
 
 def normalize_header_value(value):
     """Normalize a FITS header value for deterministic matching."""
@@ -275,23 +277,175 @@ def _build_unresolved_label_options(table):
     return options
 
 
+def _unique_preserving_order(values):
+    unique = []
+    seen = set()
+    for value in values:
+        marker = str(value)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        unique.append(value)
+    return unique
+
+
+def _filter_records_by_selection(records, selections):
+    survivors = list(records)
+    for column, value in selections.items():
+        survivors = [
+            record for record in survivors
+            if str(record.get(column, '')) == str(value)
+        ]
+    return survivors
+
+
+def _build_unresolved_manual_candidates(table, excluded_labels=None):
+    candidates = []
+    seen_signatures = set()
+    excluded_labels = set(excluded_labels or ())
+
+    for row in table:
+        if str(row['IMAGE_TYPE']) != 'UNKNOWN':
+            continue
+
+        label = _preferred_unresolved_label(row)
+        if label in excluded_labels:
+            continue
+
+        signature = _normalized_signature(row['EXPTYPE_NORM'], row['OBJECT_NORM'])
+        if signature in seen_signatures:
+            continue
+        seen_signatures.add(signature)
+
+        candidates.append({
+            'EXPTYPE_NORM': str(row.get('EXPTYPE_NORM', '')),
+            'OBJECT_NORM': str(row.get('OBJECT_NORM', '')),
+            'EXPTYPE': str(row.get('EXPTYPE', '')),
+            'OBJECT': str(row.get('OBJECT', '')),
+            'signature': signature,
+            'label': label,
+        })
+
+    return candidates
+
+
+def _format_manual_filter_summary(selections):
+    if not selections:
+        return '(none)'
+    return ', '.join(
+        f"{column}='{value}'" for column, value in selections.items()
+    )
+
+
+def _format_unresolved_candidate_label(record):
+    return (
+        f"{record.get('label', 'unknown')} "
+        f"(EXPTYPE_NORM='{record.get('EXPTYPE_NORM', '')}', "
+        f"OBJECT_NORM='{record.get('OBJECT_NORM', '')}')"
+    )
+
+
+def _prompt_manual_column_selection(question, candidates):
+    ordered_columns = ('EXPTYPE_NORM', 'OBJECT_NORM')
+    scoped_candidates = list(candidates)
+    selections = {}
+
+    if not scoped_candidates:
+        return None
+
+    for column in ordered_columns:
+        values = _unique_preserving_order([
+            record.get(column, '') for record in scoped_candidates
+            if str(record.get(column, '')).strip()
+        ])
+
+        if not values:
+            continue
+
+        if len(values) == 1:
+            selections[column] = values[0]
+            matches = _filter_records_by_selection(scoped_candidates, selections)
+            if len(matches) == 1:
+                return matches
+            continue
+
+        print(f"\nManual selection for {question} image label")
+        if selections:
+            print(f"Current filter: {_format_manual_filter_summary(selections)}")
+        print(f"Choose {column}:")
+        for idx, value in enumerate(values, start=1):
+            print(f"[{idx}] {value}")
+        print('[Enter] cancel manual mode')
+
+        while True:
+            answer = input('Selection: ').strip()
+            if not answer:
+                return None
+            try:
+                selected = int(answer)
+            except ValueError:
+                print('Invalid selection. Please enter a menu number.')
+                continue
+            if 1 <= selected <= len(values):
+                chosen_value = values[selected - 1]
+                selections[column] = chosen_value
+                matches = _filter_records_by_selection(scoped_candidates, selections)
+                if len(matches) == 1:
+                    return matches
+                break
+            print('Invalid selection. Please enter a menu number.')
+
+    survivors = _filter_records_by_selection(scoped_candidates, selections)
+
+    if len(survivors) == 1:
+        return survivors
+
+    if len(survivors) > 1:
+        print('\nManual narrowing matched multiple candidates. Choose one:')
+        for idx, record in enumerate(survivors, start=1):
+            print(f"[{idx}] {_format_unresolved_candidate_label(record)}")
+        print('[Enter] cancel manual mode')
+
+        while True:
+            answer = input('Selection: ').strip()
+            if not answer:
+                return None
+            try:
+                selected = int(answer)
+            except ValueError:
+                print('Invalid selection. Please enter a menu number.')
+                continue
+            if 1 <= selected <= len(survivors):
+                return [survivors[selected - 1]]
+            print('Invalid selection. Please enter a menu number.')
+
+    if selections:
+        print('No candidates matched that exact column combination. Returning to parent prompt.')
+
+    return None
+
+
 def _prompt_numbered_label_selection(question, options):
     print(f"\nWhich of the following is the {question} image label:")
     for idx, entry in enumerate(options, start=1):
         print(f"[{idx}] {entry['label']}")
+    if len(options) > 1:
+        print('[m] Enter values column-by-column')
 
     while True:
         answer = input('Selection (Enter to skip): ').strip()
         if not answer:
             return None
+        if answer.lower() == 'm':
+            return _MANUAL_COLUMN_SELECTION
         try:
             selected = int(answer)
         except ValueError:
-            print('Invalid selection. Please enter a number from the menu.')
+            print("Invalid selection. Please enter a menu number or 'm'.")
             continue
         if 1 <= selected <= len(options):
             return options[selected - 1]
-        print('Invalid selection. Please enter a number from the menu.')
+        print("Invalid selection. Please enter a menu number or 'm'.")
 
 
 def _prompt_unresolved_classifications(table, overrides, override_path):
@@ -313,16 +467,47 @@ def _prompt_unresolved_classifications(table, overrides, override_path):
         if not options:
             break
 
-        chosen = _prompt_numbered_label_selection(question, options)
-        if chosen is None:
-            continue
+        while True:
+            chosen = _prompt_numbered_label_selection(question, options)
+            if chosen is None:
+                break
 
-        for signature in chosen['signatures']:
-            overrides[signature] = image_type
-        assigned_labels.add(chosen['label'])
-        save_image_type_overrides(overrides, override_path)
-        table = _apply_classification_rows(table, overrides)
-        updated = True
+            if chosen == _MANUAL_COLUMN_SELECTION:
+                manual_candidates = _build_unresolved_manual_candidates(
+                    table,
+                    excluded_labels=assigned_labels,
+                )
+                selected_records = _prompt_manual_column_selection(question, manual_candidates)
+                if selected_records is None:
+                    continue
+
+                selected_signatures = _unique_preserving_order([
+                    record.get('signature', '')
+                    for record in selected_records
+                    if record.get('signature', '')
+                ])
+                if not selected_signatures:
+                    continue
+
+                for signature in selected_signatures:
+                    overrides[signature] = image_type
+                assigned_labels.update({
+                    record.get('label', '')
+                    for record in selected_records
+                    if record.get('label', '')
+                })
+                save_image_type_overrides(overrides, override_path)
+                table = _apply_classification_rows(table, overrides)
+                updated = True
+                break
+
+            for signature in chosen['signatures']:
+                overrides[signature] = image_type
+            assigned_labels.add(chosen['label'])
+            save_image_type_overrides(overrides, override_path)
+            table = _apply_classification_rows(table, overrides)
+            updated = True
+            break
 
     return table, updated
 

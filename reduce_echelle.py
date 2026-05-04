@@ -325,6 +325,8 @@ ROLE_TO_IMAGE_TYPE = {
     "dark": "DARK",
 }
 
+_MANUAL_MENU_SELECTION = "__MANUAL_MENU_SELECTION__"
+
 
 def _normalized_signature(exptype_norm, object_norm):
     return f"exptype={exptype_norm}|object={object_norm}"
@@ -569,6 +571,204 @@ def _format_inventory_label(group):
     )
 
 
+def _format_inventory_group_context_label(group):
+    return (
+        f"NIGHT={group.get('night', '')} "
+        f"SHOE={group.get('shoe', '')} "
+        f"PLATE={group.get('plate_label', group.get('plate', ''))} "
+        f"EXPTYPE='{group.get('exptype_label', '')}' "
+        f"OBJECT='{group.get('object_label', '')}'"
+    )
+
+
+def _format_manual_selection_summary(selections):
+    if not selections:
+        return "(none)"
+    return ", ".join(
+        f"{column}='{value}'" for column, value in selections.items()
+    )
+
+
+def _get_unique_group_values(groups, column):
+    unique = []
+    seen = set()
+    for group in groups:
+        value = group.get(column, "")
+        marker = str(value)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        unique.append(value)
+    return unique
+
+
+def _filter_groups_by_value(groups, column, value):
+    return [
+        group for group in groups
+        if str(group.get(column, "")) == str(value)
+    ]
+
+
+def _filter_groups_by_selections(groups, selections):
+    survivors = list(groups)
+    for column, value in selections.items():
+        survivors = _filter_groups_by_value(survivors, column, value)
+    return survivors
+
+
+def _display_value_for_group_column(group, column):
+    if column == "night":
+        return str(group.get("night", "")).strip() or "(blank)"
+    if column == "shoe":
+        return str(group.get("shoe", "")).strip() or "(blank)"
+    if column == "plate":
+        plate_label = str(group.get("plate_label", "")).strip()
+        plate_raw = str(group.get("plate", "")).strip()
+        plate_value = plate_label or plate_raw
+        return plate_value or "(blank)"
+    if column == "exptype_norm":
+        label = str(group.get("exptype_label", "")).strip()
+        norm = str(group.get("exptype_norm", "")).strip()
+        if label and norm:
+            return f"'{label}'   [norm='{norm}']"
+        return label or norm or "(blank)"
+    if column == "object_norm":
+        label = str(group.get("object_label", "")).strip()
+        norm = str(group.get("object_norm", "")).strip()
+        if label and norm:
+            return f"'{label}'   [norm='{norm}']"
+        return label or norm or "(blank)"
+    value = str(group.get(column, "")).strip()
+    return value or "(blank)"
+
+
+def _prompt_manual_inventory_group_selection(
+    candidates,
+    parent_question,
+    fixed_columns=None,
+    ordered_columns=None,
+    final_option_formatter=None,
+):
+    scoped_candidates = list(candidates)
+    selections = {}
+    fixed_columns = fixed_columns or {}
+    ordered_columns = ordered_columns or (
+        "night",
+        "shoe",
+        "plate",
+        "exptype_norm",
+        "object_norm",
+    )
+    final_option_formatter = final_option_formatter or _format_inventory_label
+
+    for column in ordered_columns:
+        fixed_value = fixed_columns.get(column)
+        if fixed_value not in (None, ""):
+            scoped_candidates = _filter_groups_by_value(scoped_candidates, column, fixed_value)
+            selections[column] = fixed_value
+            if len(scoped_candidates) <= 1:
+                return scoped_candidates[0] if scoped_candidates else None
+
+    for column in ordered_columns:
+        fixed_value = fixed_columns.get(column)
+        if fixed_value not in (None, ""):
+            continue
+
+        values = _get_unique_group_values(scoped_candidates, column)
+        if not values:
+            continue
+
+        if len(values) == 1:
+            selections[column] = values[0]
+            matches = _filter_groups_by_selections(scoped_candidates, selections)
+            if len(matches) == 1:
+                return matches[0]
+            continue
+
+        print(f"\nManual selection for {parent_question}")
+        if selections:
+            print(f"Current filter: {_format_manual_selection_summary(selections)}")
+        print(f"Choose {column}:")
+
+        for idx, value in enumerate(values, start=1):
+            sample_group = next(
+                (
+                    group for group in scoped_candidates
+                    if str(group.get(column, "")) == str(value)
+                ),
+                None,
+            )
+            display_value = _display_value_for_group_column(sample_group or {}, column)
+            print(f"[{idx}] {display_value}")
+        print("[Enter] cancel manual mode")
+
+        while True:
+            answer = _prompt_input("Selection: ").strip()
+            if not answer:
+                return None
+            try:
+                selected = int(answer)
+            except ValueError:
+                print("Invalid selection. Please enter a menu number.")
+                continue
+            if 1 <= selected <= len(values):
+                chosen_value = values[selected - 1]
+                selections[column] = chosen_value
+                matches = _filter_groups_by_selections(scoped_candidates, selections)
+                if len(matches) == 1:
+                    return matches[0]
+                break
+            print("Invalid selection. Please enter a menu number.")
+
+    survivors = _filter_groups_by_selections(scoped_candidates, selections)
+
+    if len(survivors) == 1:
+        return survivors[0]
+
+    if len(survivors) > 1:
+        print("\nManual narrowing matched multiple candidates. Choose one:")
+        for idx, group in enumerate(survivors, start=1):
+            print(f"[{idx}] {final_option_formatter(group)}")
+        print("[Enter] cancel manual mode")
+
+        while True:
+            answer = _prompt_input("Selection: ").strip()
+            if not answer:
+                return None
+            try:
+                selected = int(answer)
+            except ValueError:
+                print("Invalid selection. Please enter a menu number.")
+                continue
+            if 1 <= selected <= len(survivors):
+                return survivors[selected - 1]
+            print("Invalid selection. Please enter a menu number.")
+
+    if selections:
+        print("No candidates matched that exact column combination. Returning to parent prompt.")
+
+    return None
+
+
+def _group_from_candidate(meta):
+    exptype_label = str(meta.get("EXPTYPE", ""))
+    object_label = str(meta.get("OBJECT", ""))
+    exptype_norm = normalize_header_value(exptype_label)
+    object_norm = normalize_header_value(object_label)
+
+    return {
+        "night": str(meta.get("NIGHT", "")),
+        "shoe": str(meta.get("SHOE", "")),
+        "plate": str(meta.get("PLATE", "")).strip(),
+        "plate_label": str(meta.get("PLATE", "")).strip(),
+        "exptype_norm": exptype_norm,
+        "object_norm": object_norm,
+        "exptype_label": exptype_label,
+        "object_label": object_label,
+        "_candidate": meta,
+    }
+
+
 def _format_inventory_combinations(groups):
     if not groups:
         return ["  (none discovered)"]
@@ -628,11 +828,15 @@ def _prompt_numbered_menu(question, options, text_aliases=None):
     print(question)
     for idx, option in enumerate(options, start=1):
         print(f"[{idx}] {option}")
+    if len(options) > 1:
+        print("[m] Enter values column-by-column")
 
     while True:
         answer = _prompt_input("Selection (Enter to skip): ").strip()
         if not answer:
             return None
+        if answer.lower() == "m":
+            return _MANUAL_MENU_SELECTION
         if text_aliases:
             alias_index = text_aliases.get(answer.upper())
             if alias_index is not None:
@@ -641,18 +845,22 @@ def _prompt_numbered_menu(question, options, text_aliases=None):
             selected = int(answer)
         except ValueError:
             if text_aliases:
-                valid_text = "/".join(sorted(text_aliases.keys()))
-                print(f"Invalid selection. Please enter a menu number or one of: {valid_text}.")
+                valid_text = ", ".join(sorted(text_aliases.keys()))
+                print(
+                    f"Invalid selection. Please enter a menu number, one of: {valid_text}, or 'm'."
+                )
             else:
-                print("Invalid selection. Please enter a number from the menu.")
+                print("Invalid selection. Please enter a menu number or 'm'.")
             continue
         if 1 <= selected <= len(options):
             return selected - 1
         if text_aliases:
-            valid_text = "/".join(sorted(text_aliases.keys()))
-            print(f"Invalid selection. Please enter a menu number or one of: {valid_text}.")
+            valid_text = ", ".join(sorted(text_aliases.keys()))
+            print(
+                f"Invalid selection. Please enter a menu number, one of: {valid_text}, or 'm'."
+            )
         else:
-            print("Invalid selection. Please enter a number from the menu.")
+            print("Invalid selection. Please enter a menu number or 'm'.")
 
 
 def _prompt_for_missing_roles_from_inventory(args, missing_roles, inventory):
@@ -672,15 +880,31 @@ def _prompt_for_missing_roles_from_inventory(args, missing_roles, inventory):
         if not interactive:
             return selected
         shoe_aliases = {str(option).upper(): idx for idx, option in enumerate(shoe_options)}
-        idx = _prompt_numbered_menu(
-            "Which SHOE should be used for unresolved role mapping?",
-            shoe_options,
-            text_aliases=shoe_aliases,
-        )
-        if idx is None:
-            return selected
-        chosen_shoe = shoe_options[idx]
-        groups = [g for g in groups if g["shoe"] == chosen_shoe]
+        while True:
+            idx = _prompt_numbered_menu(
+                "Which SHOE should be used for unresolved role mapping?",
+                shoe_options,
+                text_aliases=shoe_aliases,
+            )
+            if idx is None:
+                return selected
+            if idx == _MANUAL_MENU_SELECTION:
+                manual_group = _prompt_manual_inventory_group_selection(
+                    groups,
+                    parent_question="SHOE selection",
+                    fixed_columns={
+                        "night": inventory.get("night"),
+                        "plate": inventory.get("plate"),
+                    },
+                    final_option_formatter=_format_inventory_group_context_label,
+                )
+                if manual_group is None:
+                    continue
+                chosen_shoe = manual_group.get("shoe")
+            else:
+                chosen_shoe = shoe_options[idx]
+            groups = [g for g in groups if g["shoe"] == chosen_shoe]
+            break
 
     scope_night = inventory.get("night")
     if scope_night is None:
@@ -710,34 +934,59 @@ def _prompt_for_missing_roles_from_inventory(args, missing_roles, inventory):
             continue
 
         if interactive:
-            if role == "dark":
-                question = (
-                    "\nWhich of the following is the DARK_MASTER image label for "
-                    f"SHOE={chosen_shoe or '*'}? "
-                    "(NIGHT/PLATE shown for context only)"
-                )
-                menu_options = [
-                    (
-                        f"NIGHT={g.get('night', '')} "
-                        f"SHOE={g.get('shoe', '')} "
-                        f"PLATE={g.get('plate_label', g.get('plate', ''))} "
-                        f"EXPTYPE='{g.get('exptype_label', '')}' "
-                        f"OBJECT='{g.get('object_label', '')}'"
+            while True:
+                if role == "dark":
+                    question = (
+                        "\nWhich of the following is the DARK_MASTER image label for "
+                        f"SHOE={chosen_shoe or '*'}? "
+                        "(NIGHT/PLATE shown for context only)"
                     )
-                    for g in role_groups
-                ]
-            else:
-                question = (
-                    f"\nWhich of the following is the {role_prompt_names.get(role, role)} "
-                    "image label for "
-                    f"NIGHT={scope_night or '*'} SHOE={chosen_shoe or '*'} "
-                    f"PLATE={inventory.get('plate') or '*'}:"
-                )
-                menu_options = [_format_inventory_label(g) for g in role_groups]
-            idx = _prompt_numbered_menu(question, menu_options)
-            if idx is None:
+                    menu_options = [
+                        _format_inventory_group_context_label(g)
+                        for g in role_groups
+                    ]
+                else:
+                    question = (
+                        f"\nWhich of the following is the {role_prompt_names.get(role, role)} "
+                        "image label for "
+                        f"NIGHT={scope_night or '*'} SHOE={chosen_shoe or '*'} "
+                        f"PLATE={inventory.get('plate') or '*'}:"
+                    )
+                    menu_options = [_format_inventory_label(g) for g in role_groups]
+
+                idx = _prompt_numbered_menu(question, menu_options)
+                if idx is None:
+                    chosen_group = None
+                    break
+
+                if idx == _MANUAL_MENU_SELECTION:
+                    manual_fixed_columns = {
+                        "shoe": chosen_shoe,
+                    }
+                    if role != "dark":
+                        manual_fixed_columns["night"] = scope_night
+                        manual_fixed_columns["plate"] = inventory.get("plate")
+
+                    manual_group = _prompt_manual_inventory_group_selection(
+                        role_groups,
+                        parent_question=role_prompt_names.get(role, role),
+                        fixed_columns=manual_fixed_columns,
+                        final_option_formatter=(
+                            _format_inventory_group_context_label
+                            if role == "dark"
+                            else _format_inventory_label
+                        ),
+                    )
+                    if manual_group is None:
+                        continue
+                    chosen_group = manual_group
+                    break
+
+                chosen_group = role_groups[idx]
+                break
+
+            if chosen_group is None:
                 continue
-            chosen_group = role_groups[idx]
         elif len(predicted) == 1:
             chosen_group = predicted[0]
         else:
@@ -811,13 +1060,47 @@ def _format_object_candidate_option(meta):
 def _prompt_for_object_candidate(candidates):
     """Prompt interactively to select one ambiguous object candidate."""
     options = [_format_object_candidate_option(meta) for meta in candidates]
-    idx = _prompt_numbered_menu(
-        "Multiple processed SCIENCE/object candidates were found. Select one:",
-        options,
-    )
-    if idx is None:
-        return None
-    return candidates[idx]
+    while True:
+        idx = _prompt_numbered_menu(
+            "Multiple processed SCIENCE/object candidates were found. Select one:",
+            options,
+        )
+        if idx is None:
+            return None
+        if idx == _MANUAL_MENU_SELECTION:
+            candidate_groups = [_group_from_candidate(meta) for meta in candidates]
+            selected_group = _prompt_manual_inventory_group_selection(
+                candidate_groups,
+                parent_question="science/object candidate selection",
+                final_option_formatter=lambda g: _format_object_candidate_option(g.get("_candidate", {})),
+            )
+            if selected_group is None:
+                continue
+            return selected_group.get("_candidate")
+        return candidates[idx]
+
+
+def _prompt_for_role_candidate(role, candidates):
+    """Prompt interactively to select one ambiguous non-object role candidate."""
+    options = [_format_object_candidate_option(meta) for meta in candidates]
+    while True:
+        idx = _prompt_numbered_menu(
+            f"Multiple processed {role} candidates were found. Select one:",
+            options,
+        )
+        if idx is None:
+            return None
+        if idx == _MANUAL_MENU_SELECTION:
+            candidate_groups = [_group_from_candidate(meta) for meta in candidates]
+            selected_group = _prompt_manual_inventory_group_selection(
+                candidate_groups,
+                parent_question=f"{role} candidate selection",
+                final_option_formatter=lambda g: _format_object_candidate_option(g.get("_candidate", {})),
+            )
+            if selected_group is None:
+                continue
+            return selected_group.get("_candidate")
+        return candidates[idx]
 
 
 def _select_unique_candidate(role, candidates):
@@ -845,12 +1128,14 @@ def _select_unique_candidate(role, candidates):
                 return r_shoe[0]
             return tied[0]
 
-        # Identical rank and same shoe: still ambiguous, fail
-        if len(tied) > 1:
-            if role == "object" and _can_prompt_user():
+        # Identical rank and same shoe: prompt if interactive, otherwise fail.
+        if len(tied) > 1 and _can_prompt_user():
+            if role == "object":
                 selected = _prompt_for_object_candidate(tied)
-                if selected is not None:
-                    return selected
+            else:
+                selected = _prompt_for_role_candidate(role, tied)
+            if selected is not None:
+                return selected
 
     msg = [f"Ambiguous candidates for role '{role}':"]
     for c in scored:
