@@ -239,6 +239,7 @@ def read_required_metadata(filepath):
         "path": filepath,
         "OBJECT": str(hdr["OBJECT"]),
         "EXPTYPE": str(hdr["EXPTYPE"]),
+        "EXPTIME": str(hdr.get("EXPTIME", "")).strip(),
         "IMAGE_TYPE": str(hdr.get("IMAGE_TYPE", "")).strip().upper(),
         "NIGHT": str(hdr["NIGHT"]),
         "SHOE": str(hdr["SHOE"]),
@@ -1069,9 +1070,11 @@ def processing_rank(meta):
 
 def _format_object_candidate_option(meta):
     """Build a concise disambiguation label for object candidates."""
+    exptime = str(meta.get("EXPTIME", "")).strip() or "na"
     return (
         f"{os.path.basename(meta.get('path', ''))} | "
         f"OBJECT={meta.get('OBJECT', '')} "
+        f"EXPTIME={exptime} "
         f"NIGHT={meta.get('NIGHT', '')} "
         f"SHOE={meta.get('SHOE', '')} "
         f"PLATE={meta.get('PLATE', '')} "
@@ -3965,6 +3968,16 @@ def parse_args():
                    help="Pass --bias to image_processing.py.")
     p.add_argument("--preprocess-flat", default=None,
                    help="Pass --flat <file> to image_processing.py.")
+    p.add_argument(
+        "--cleanup",
+        default="true",
+        choices=["true", "false"],
+        help=(
+            "Pass cleanup choice through to image_processing.py when --run-preprocess "
+            "is used. Use '--cleanup false' to keep preprocessing intermediates. "
+            "Default: true."
+        ),
+    )
     p.add_argument("--night", default=None,
                    help="Restrict auto-discovery to this NIGHT value.")
     p.add_argument(
@@ -4592,6 +4605,7 @@ def run_image_preprocessing(args, raw_input_dir, required_roles):
         cmd.append("--bias")
     if args.preprocess_flat:
         cmd.extend(["--flat", args.preprocess_flat])
+    cmd.extend(["--cleanup", str(args.cleanup)])
 
     print("  Launching preprocessing:")
     print("    " + " ".join(cmd))
@@ -4601,6 +4615,10 @@ def run_image_preprocessing(args, raw_input_dir, required_roles):
         raise RuntimeError(
             f"image_processing.py failed with exit code {exc.returncode}"
         ) from exc
+
+    if getattr(args, "preprocess_only", False):
+        print("  Preprocess-only mode: skipping post-preprocess echelle input discovery.")
+        return
 
     # Validate that required stacked products now exist for requested context.
     post = discover_inputs(
